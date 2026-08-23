@@ -611,17 +611,27 @@ void Builder::RefreshPriority(const std::vector<Node*>& start_nodes) {
     }
   }
   std::vector<std::pair<Edge*, int64_t>> todos;
+  std::unordered_set<Edge*> initial_edges;
   std::unique_ptr<ThreadPool> thread_pool = CreateThreadPool();
   for (Node* node : start_nodes) {
-    if (node && node->in_edge()) {
-      todos.emplace_back(std::make_pair(node->in_edge(), 0));
+    Edge* edge = node ? node->in_edge() : nullptr;
+    if (edge && initial_edges.insert(edge).second) {
+      todos.emplace_back(std::make_pair(edge, 0));
     }
   }
+
+  struct PriorityResult {
+    int64_t priority;
+    std::vector<Edge*> next_edges;
+    int64_t estimated_time;
+  };
 
   // Get weight from data source or ninja log, it isn't related to Edge.weight,
   // because Edge.weight is used for task distribution across pools which we don't
   // want to do that in this context.
-  auto weight_getter = [&data_source, this](Edge* edge) -> int64_t {
+  auto weight_getter = [&data_source, this](Edge* edge,
+                                            int64_t* estimated_time) -> int64_t {
+    *estimated_time = -1;
     if (!edge || edge->outputs_ready()) {
       return 0;
     }
@@ -636,7 +646,7 @@ void Builder::RefreshPriority(const std::vector<Node*>& start_nodes) {
           auto* entry = scan_.build_log()->LookupByOutput(edge->outputs_[0]->globalPath());
           if (entry) {
             edge->estimated_time_ = entry->end_time - entry->start_time + 1;
-            status_->AddEstimatedTime(edge->estimated_time());
+            *estimated_time = edge->estimated_time();
             return edge->estimated_time();
           }
         } else {
@@ -657,17 +667,19 @@ void Builder::RefreshPriority(const std::vector<Node*>& start_nodes) {
       auto acc = p.second;
 
       if (!e) {
-        return std::make_pair((int64_t)0, std::unordered_map<Edge*, int64_t>());
+        return PriorityResult{0, {}, -1};
       }
-      auto run = weight_getter(e);
+      int64_t estimated_time;
+      auto run = weight_getter(e, &estimated_time);
       auto new_priority = run + acc;
       // Skip if priority isn't updated
       if (new_priority <= e->priority()) {
-        return std::make_pair(e->priority(), std::unordered_map<Edge*, int64_t>());
+        return PriorityResult{e->priority(), {}, estimated_time};
       }
       e->priority_ = new_priority;
 
-      std::set<Edge*, EdgeCmp> next_edges;
+      std::vector<Edge*> next_edges;
+      next_edges.reserve(e->inputs_.size());
       for (auto* next_node : e->inputs_) {
         // Skip if the next node isn't dirty because actual build also skips the node.
         if (!next_node || !next_node->dirty()) {
@@ -675,31 +687,28 @@ void Builder::RefreshPriority(const std::vector<Node*>& start_nodes) {
         }
         auto* next_e = next_node->in_edge();
         if (next_e) {
-          next_edges.insert(next_e);
+          next_edges.push_back(next_e);
         }
       }
-
-      std::unordered_map<Edge*, int64_t> next_todo_map;
-      for (auto* ne : next_edges) {
-        auto next_run = weight_getter(ne);
-        if (next_run + e->priority() > ne->priority()) {
-          next_todo_map.try_emplace(ne, e->priority());
-        }
-      }
-      return std::make_pair(e->priority(), next_todo_map);
+      return PriorityResult{
+          e->priority(), std::move(next_edges), estimated_time};
     });
     todos.clear();
 
     std::unordered_map<Edge*, int64_t> next_todo_map_total;
-    for (const auto& [priority, todo_map] : result) {
-      if (config_.ninja_log_as_weight_list) {
-        critical_time_millis_ = std::max(critical_time_millis_, priority);
+    for (const auto& item : result) {
+      if (item.estimated_time >= 0) {
+        status_->AddEstimatedTime(item.estimated_time);
       }
-      for (const auto& [k, v] : todo_map) {
-        auto [it, inserted] = next_todo_map_total.try_emplace(k, v);
-          if (!inserted) {
-            it->second = std::max(it->second, v);
-          }
+      if (config_.ninja_log_as_weight_list) {
+        critical_time_millis_ = std::max(critical_time_millis_, item.priority);
+      }
+      for (Edge* next_edge : item.next_edges) {
+        auto [it, inserted] =
+            next_todo_map_total.try_emplace(next_edge, item.priority);
+        if (!inserted) {
+          it->second = std::max(it->second, item.priority);
+        }
       }
     }
     for (const auto& [key, value] : next_todo_map_total) {

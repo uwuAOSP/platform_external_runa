@@ -1204,6 +1204,7 @@ bool DebugEnable(const string& name) {
 "  explain      explain what caused a command to execute\n"
 "  keepdepfile  don't delete depfiles after they're read by ninja\n"
 "  keeprsp      don't delete @response files on success\n"
+"  assumeexisting trust existing outputs with missing build log entries\n"
 #ifdef _WIN32
 "  nostatcache  don't batch stat() calls per directory and cache them\n"
 #endif
@@ -1222,6 +1223,9 @@ bool DebugEnable(const string& name) {
   } else if (name == "keeprsp") {
     g_keep_rsp = true;
     return true;
+  } else if (name == "assumeexisting") {
+    g_assume_existing = true;
+    return true;
   } else if (name == "nostatcache") {
     g_experimental_statcache = false;
     return true;
@@ -1232,7 +1236,7 @@ bool DebugEnable(const string& name) {
     const char* suggestion =
         SpellcheckString(name.c_str(),
                          "stats", "explain", "keepdepfile", "keeprsp",
-                         "nostatcache", "nothreads", NULL);
+                         "assumeexisting", "nostatcache", "nothreads", NULL);
     if (suggestion) {
       Error("unknown debug setting '%s', did you mean '%s'?",
             name.c_str(), suggestion);

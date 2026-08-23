@@ -28,6 +28,8 @@ extern bool g_keep_depfile;
 
 extern bool g_keep_rsp;
 
+extern bool g_assume_existing;
+
 extern bool g_experimental_statcache;
 
 extern bool g_use_threads;

@@ -512,7 +512,7 @@ bool DependencyScan::RecomputeOutputDirty(Edge* edge,
         return true;
       }
     }
-    if (!entry && !generator) {
+    if (!entry && !generator && !g_assume_existing) {
       EXPLAIN("command line not found in log for %s", output->globalPath().h.data());
       return true;
     }

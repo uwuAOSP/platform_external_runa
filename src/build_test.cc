@@ -580,6 +580,23 @@ struct BuildTest : public StateTestWithBuiltinRules, public BuildLogUser {
   FakeStatus status_;
 };
 
+TEST_F(BuildTest, RefreshPriorityHandlesCrossLevelDependencies) {
+  ASSERT_NO_FATAL_FAILURE(AssertParse(
+      &state_, "build priority_a: cat in1\n"
+               "build priority_b: cat priority_a\n"
+               "build priority_out: cat priority_a priority_b\n"));
+
+  BuildConfig config = MakeConfig();
+  config.ninja_log_as_weight_list = true;
+  Builder builder(&state_, config, NULL, NULL, &fs_, &status_, 0);
+  string err;
+  ASSERT_TRUE(builder.AddTarget("priority_out", &err));
+  ASSERT_EQ("", err);
+  EXPECT_EQ(1, GetNode("priority_out")->in_edge()->priority());
+  EXPECT_EQ(2, GetNode("priority_b")->in_edge()->priority());
+  EXPECT_EQ(3, GetNode("priority_a")->in_edge()->priority());
+}
+
 void BuildTest::RebuildTarget(const string& target, const char* manifest,
                               const char* log_path, const char* deps_path,
                               State* state) {

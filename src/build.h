@@ -172,7 +172,8 @@ struct BuildConfig {
                   missing_output_file_should_err(false),
                   old_output_should_err(false),
                   pre_remove_output_files(false),
-                  weight_list_path(std::nullopt) {}
+                  weight_list_path(std::nullopt),
+                  ninja_log_as_weight_list(false) {}
 
   enum Verbosity {
     NORMAL,
