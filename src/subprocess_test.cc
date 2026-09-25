@@ -117,6 +117,20 @@ TEST_F(SubprocessTest, InterruptChildWithSigTerm) {
   EXPECT_EQ(ExitInterrupted, subproc->Finish());
 }
 
+TEST_F(SubprocessTest, TerminateProcessGroupForRetry) {
+  EdgeCommand c;
+  c.command = "sleep 30";
+  Subprocess* subproc = subprocs_.Add(c);
+  ASSERT_NE((Subprocess *) 0, subproc);
+  EXPECT_TRUE(subprocs_.IsRunning(subproc));
+  EXPECT_TRUE(subprocs_.TerminateForRetry(subproc));
+
+  while (!subproc->Done())
+    subprocs_.DoWork();
+
+  EXPECT_NE(ExitSuccess, subproc->Finish());
+}
+
 TEST_F(SubprocessTest, InterruptParentWithSigTerm) {
   EdgeCommand c;
   c.command = "kill -TERM $PPID ; sleep 1";

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 cc_defaults {
-    name: "ninja_defaults",
+    name: "runa_defaults",
     cflags: [
         "-Wall",
         "-Wextra",
@@ -34,7 +34,7 @@ cc_defaults {
 }
 
 genrule {
-    name: "ninja_browse_py",
+    name: "runa_browse_py",
 
     cmd: "$(location src/inline.sh) kBrowsePy <$(in) >$(out)",
     tool_files: ["src/inline.sh"],
@@ -44,9 +44,9 @@ genrule {
 }
 
 cc_library_host_static {
-    name: "libninja",
-    defaults: ["ninja_defaults"],
-    generated_headers: ["ninja_browse_py"],
+    name: "libruna",
+    defaults: ["runa_defaults"],
+    generated_headers: ["runa_browse_py"],
     srcs: [
         "src/build.cc",
         "src/build_log.cc",
@@ -69,6 +69,7 @@ cc_library_host_static {
         "src/metrics.cc",
         "src/parser.cc",
         "src/proto.cc",
+        "src/runtime_control.cc",
         "src/state.cc",
         "src/status.cc",
         "src/thread_pool.cc",
@@ -80,10 +81,10 @@ cc_library_host_static {
 }
 
 cc_binary_host {
-    name: "ninja",
-    defaults: ["ninja_defaults"],
+    name: "runa",
+    defaults: ["runa_defaults"],
     srcs: ["src/ninja.cc"],
-    static_libs: ["libninja"],
+    static_libs: ["libruna"],
 
     // Use jemalloc for better multithreaded allocation performance. e.g. Using
     // jemalloc can improve the overall runtime by 10x vs the default allocator.
@@ -93,9 +94,9 @@ cc_binary_host {
         },
         musl: {
             static_libs: ["libjemalloc5"],
-            // LLVM toolchain builds use LD_LIBRARY_PATH when running ninja
-            // to affect subprocesses of ninja, but that breaks ninja
-            // when it uses an incompatible libc.  Making ninja static avoids
+            // LLVM toolchain builds use LD_LIBRARY_PATH when running Runa
+            // to affect Runa subprocesses, but that breaks Runa when it uses
+            // an incompatible libc. Making Runa static avoids
             // the problem.
             static_executable: true,
         },
@@ -103,9 +104,9 @@ cc_binary_host {
 }
 
 cc_test_host {
-    name: "ninja_test",
-    defaults: ["ninja_defaults"],
-    static_libs: ["libninja"],
+    name: "runa_test",
+    defaults: ["runa_defaults"],
+    static_libs: ["libruna"],
     gtest: false,
     cpp_std: "gnu++17",
     srcs: [
@@ -131,41 +132,41 @@ cc_test_host {
 }
 
 cc_test_host {
-    name: "ninja_build_log_perftest",
+    name: "runa_build_log_perftest",
     gtest: false,
-    defaults: ["ninja_defaults"],
-    static_libs: ["libninja"],
+    defaults: ["runa_defaults"],
+    static_libs: ["libruna"],
     srcs: ["src/build_log_perftest.cc"],
 }
 
 cc_test_host {
-    name: "ninja_canon_perftest",
+    name: "runa_canon_perftest",
     gtest: false,
-    defaults: ["ninja_defaults"],
-    static_libs: ["libninja"],
+    defaults: ["runa_defaults"],
+    static_libs: ["libruna"],
     srcs: ["src/canon_perftest.cc"],
 }
 
 cc_test_host {
-    name: "ninja_depfile_parser_perftest",
+    name: "runa_depfile_parser_perftest",
     gtest: false,
-    defaults: ["ninja_defaults"],
-    static_libs: ["libninja"],
+    defaults: ["runa_defaults"],
+    static_libs: ["libruna"],
     srcs: ["src/depfile_parser_perftest.cc"],
 }
 
 cc_test_host {
-    name: "ninja_hash_collision_bench",
+    name: "runa_hash_collision_bench",
     gtest: false,
-    defaults: ["ninja_defaults"],
-    static_libs: ["libninja"],
+    defaults: ["runa_defaults"],
+    static_libs: ["libruna"],
     srcs: ["src/hash_collision_bench.cc"],
 }
 
 cc_test_host {
-    name: "ninja_manifest_parser_perftest",
+    name: "runa_manifest_parser_perftest",
     gtest: false,
-    defaults: ["ninja_defaults"],
-    static_libs: ["libninja"],
+    defaults: ["runa_defaults"],
+    static_libs: ["libruna"],
     srcs: ["src/manifest_parser_perftest.cc"],
 }

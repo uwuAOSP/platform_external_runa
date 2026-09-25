@@ -42,6 +42,8 @@ struct Status {
   virtual void Error(const char* msg, ...) = 0;
   virtual void AddEstimatedTime(int64_t estimated_time_millis) = 0;
   virtual void SetCriticalPathTime(int64_t critical_path_time_millis) = 0;
+  /// Publish a refreshed whole-build duration estimate after progress.
+  virtual void UpdateEstimatedTime(int64_t estimated_total_time_millis) {}
   virtual ~Status() { }
 };
 
@@ -149,6 +151,7 @@ struct StatusSerializer : Status {
 
   virtual void AddEstimatedTime(int64_t estimated_time_millis);
   virtual void SetCriticalPathTime(int64_t critical_path_time_millis);
+  virtual void UpdateEstimatedTime(int64_t estimated_total_time_millis);
 
   const BuildConfig& config_;
 

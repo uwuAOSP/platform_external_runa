@@ -62,7 +62,8 @@ struct Plan {
 
   enum EdgeResult {
     kEdgeFailed,
-    kEdgeSucceeded
+    kEdgeSucceeded,
+    kEdgeRetry
   };
 
   /// Mark an edge as done building (whether it succeeded or failed).
@@ -77,6 +78,10 @@ struct Plan {
 
   /// Number of edges with commands to run.
   int command_edge_count() const { return command_edges_; }
+
+  /// Estimate command time for the edges that remain wanted by this plan.
+  void EstimateRemainingTime(int64_t fallback_edge_time_millis,
+                             int64_t* estimated_time_millis) const;
 
   /// Reset state.  Clears want and ready sets.
   void Reset();
@@ -145,18 +150,28 @@ struct CommandRunner {
 
   /// The result of waiting for a command.
   struct Result {
-    Result() : edge(NULL) {}
+    Result() : edge(NULL), retry(false) {}
     Edge* edge;
     ExitStatus status;
 #ifndef _WIN32
     struct rusage rusage;
 #endif
     string output;
+    /// True when this attempt was cancelled by runtime control and must be
+    /// cleaned and returned to the ready queue.
+    bool retry;
     bool success() const { return status == ExitSuccess; }
   };
   /// Wait for a command to complete, or return false if interrupted.
   virtual bool WaitForCommand(Result* result) = 0;
 
+  virtual bool StartControl(const string& path, string* err) {
+    if (path.empty())
+      return true;
+    *err = "runtime control is unavailable for this command runner";
+    return false;
+  }
+  virtual void EdgeSucceeded() {}
   virtual vector<Edge*> GetActiveEdges() { return vector<Edge*>(); }
   virtual void Abort() {}
 };
@@ -185,6 +200,8 @@ struct BuildConfig {
   bool dry_run;
   int parallelism;
   int failures_allowed;
+  /// Unix socket used for runtime scheduler control. Empty disables control.
+  string control_socket_path;
   /// The maximum load average we must not exceed. A negative value
   /// means that we do not have any limit.
   double max_load_average;
@@ -260,6 +277,9 @@ struct Builder {
   /// @return false if the build can not proceed further due to a fatal error.
   bool FinishCommand(CommandRunner::Result* result, string* err);
 
+  /// Clean partial state from a cancelled command and return it to the plan.
+  bool RetryCommand(CommandRunner::Result* result, string* err);
+
   /// Used for tests.
   void SetBuildLog(BuildLog* log) {
     scan_.set_build_log(log);
@@ -284,6 +304,7 @@ struct Builder {
                     string* err);
 
   void RefreshPriority(const std::vector<Node*>& nodes);
+  void MaybeRefreshEstimate();
 
   /// Map of running edge to time the edge started running.
   typedef map<Edge*, int> RunningEdgeMap;
@@ -292,6 +313,10 @@ struct Builder {
   /// Time the build started.
   int64_t start_time_millis_;
   int64_t critical_time_millis_;
+  int64_t estimated_edge_time_millis_;
+  int64_t estimated_history_edges_;
+  int initial_command_edges_;
+  int completed_edges_since_estimate_;
 
   DiskInterface* disk_interface_;
   DependencyScan scan_;

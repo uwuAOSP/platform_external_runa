@@ -345,6 +345,8 @@ struct Status {
     bool has_involuntary_context_switches_;
     std::string tags_;
     bool has_tags_;
+    bool canceled_;
+    bool has_canceled_;
 
     EdgeFinished() {
       has_id_ = false;
@@ -373,6 +375,8 @@ struct Status {
       has_involuntary_context_switches_ = false;
       involuntary_context_switches_ = static_cast< uint64_t >(0);
       has_tags_ = false;
+      has_canceled_ = false;
+      canceled_ = static_cast< bool >(0);
     }
 
     EdgeFinished(const EdgeFinished&);
@@ -393,6 +397,7 @@ struct Status {
       WriteVarint64(output__, 12, voluntary_context_switches_);
       WriteVarint64(output__, 13, involuntary_context_switches_);
       WriteString(output__, 14, tags_);
+      WriteVarint32(output__, 15, canceled_);
     }
 
     size_t ByteSizeLong() const {
@@ -411,6 +416,7 @@ struct Status {
       size += VarintSize64(voluntary_context_switches_) + 1;
       size += VarintSize64(involuntary_context_switches_) + 1;
       size += StringSize(tags_) + 1;
+      size += VarintSizeBool(canceled_) + 1;
       return size;
     }
 
@@ -429,6 +435,7 @@ struct Status {
       voluntary_context_switches_ = static_cast< uint64_t >(0);
       involuntary_context_switches_ = static_cast< uint64_t >(0);
       tags_.clear();
+      canceled_ = static_cast< bool >(0);
     }
 
     uint32_t* mutable_id() {
@@ -542,6 +549,14 @@ struct Status {
     void set_tags(const std::string& value) {
       has_tags_ = true;
       tags_ = value;
+    }
+    bool* mutable_canceled() {
+      has_canceled_ = true;
+      return &canceled_;
+    }
+    void set_canceled(const bool& value) {
+      has_canceled_ = true;
+      canceled_ = value;
     }
   };
 

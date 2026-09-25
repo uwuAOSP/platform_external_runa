@@ -552,6 +552,7 @@ for name in ['build',
              'metrics',
              'parser',
              'proto',
+             'runtime_control',
              'state',
              'status',
              'string_piece_util',
@@ -573,15 +574,15 @@ else:
 if platform.is_aix():
     objs += cc('getopt')
 if platform.is_msvc():
-    ninja_lib = n.build(built('ninja.lib'), 'ar', objs)
+    ninja_lib = n.build(built('runa.lib'), 'ar', objs)
 else:
-    ninja_lib = n.build(built('libninja.a'), 'ar', objs)
+    ninja_lib = n.build(built('libruna.a'), 'ar', objs)
 n.newline()
 
 if platform.is_msvc():
-    libs.append('ninja.lib')
+    libs.append('runa.lib')
 else:
-    libs.append('-lninja')
+    libs.append('-lruna')
 
 if platform.is_aix():
     libs.append('-lperfstat')
@@ -590,13 +591,13 @@ all_targets = []
 
 n.comment('Main executable is library plus main() function.')
 objs = cxx('ninja', variables=cxxvariables)
-ninja = n.build(binary('ninja'), 'link', objs, implicit=ninja_lib,
+runa = n.build(binary('runa'), 'link', objs, implicit=ninja_lib,
                 variables=[('libs', libs)])
 n.newline()
-all_targets += ninja
+all_targets += runa
 
 if options.bootstrap:
-    # We've built the ninja binary.  Don't run any more commands
+    # We've built the Runa binary. Don't run any more commands
     # through the bootstrap executor, but continue writing the
     # build.ninja file.
     n = ninja_writer
@@ -631,10 +632,10 @@ if platform.is_windows():
     for name in ['includes_normalize_test', 'msvc_helper_test']:
         objs += cxx(name, variables=cxxvariables)
 
-ninja_test = n.build(binary('ninja_test'), 'link', objs, implicit=ninja_lib,
+runa_test = n.build(binary('runa_test'), 'link', objs, implicit=ninja_lib,
                      variables=[('libs', libs)])
 n.newline()
-all_targets += ninja_test
+all_targets += runa_test
 
 
 n.comment('Ancillary executables.')
@@ -655,10 +656,10 @@ n.newline()
 
 n.comment('Generate a graph using the "graph" tool.')
 n.rule('gendot',
-       command='./ninja -t graph all > $out')
+       command='./runa -t graph all > $out')
 n.rule('gengraph',
        command='dot -Tpng $in > $out')
-dot = n.build(built('graph.dot'), 'gendot', ['ninja', 'build.ninja'])
+dot = n.build(built('graph.dot'), 'gendot', ['runa', 'build.ninja'])
 n.build('graph.png', 'gengraph', dot)
 n.newline()
 
@@ -709,7 +710,7 @@ if not host.is_mingw():
                       os.path.normpath('$root/misc/ninja_syntax.py')])
     n.newline()
 
-n.default(ninja)
+n.default(runa)
 n.newline()
 
 if host.is_linux():
@@ -731,14 +732,14 @@ if options.bootstrap:
     rebuild_args = []
 
     if platform.can_rebuild_in_place():
-        rebuild_args.append('./ninja')
+        rebuild_args.append('./runa')
     else:
         if platform.is_windows():
-            bootstrap_exe = 'ninja.bootstrap.exe'
-            final_exe = 'ninja.exe'
+            bootstrap_exe = 'runa.bootstrap.exe'
+            final_exe = 'runa.exe'
         else:
-            bootstrap_exe = './ninja.bootstrap'
-            final_exe = './ninja'
+            bootstrap_exe = './runa.bootstrap'
+            final_exe = './runa'
 
         if os.path.exists(bootstrap_exe):
             os.unlink(bootstrap_exe)

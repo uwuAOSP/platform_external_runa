@@ -281,7 +281,10 @@ Subprocess *SubprocessSet::Add(const EdgeCommand& cmd) {
   return subprocess;
 }
 
-bool SubprocessSet::DoWork() {
+bool SubprocessSet::DoWork(int control_fd, bool* control_ready) {
+  (void)control_fd;
+  if (control_ready)
+    *control_ready = false;
   DWORD bytes_read;
   Subprocess* subproc;
   OVERLAPPED* overlapped;
@@ -308,6 +311,20 @@ bool SubprocessSet::DoWork() {
   }
 
   return false;
+}
+
+bool SubprocessSet::IsRunning(Subprocess* subproc) const {
+  return find(running_.begin(), running_.end(), subproc) != running_.end();
+}
+
+bool SubprocessSet::TerminateForRetry(Subprocess* subproc) {
+  (void)subproc;
+  return false;
+}
+
+uint64_t SubprocessSet::ProcessGroupRssKB(Subprocess* subproc) const {
+  (void)subproc;
+  return 0;
 }
 
 Subprocess* SubprocessSet::NextFinished() {

@@ -14,16 +14,19 @@
 
 #include "subprocess.h"
 
-#include <sys/select.h>
+#include <algorithm>
 #include <assert.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
-#include <unistd.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
-#include <sys/wait.h>
 #include <spawn.h>
+#include <sys/select.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 extern char** environ;
 
@@ -242,9 +245,12 @@ Subprocess *SubprocessSet::Add(const EdgeCommand& cmd, int extra_fd) {
 }
 
 #ifdef USE_PPOLL
-bool SubprocessSet::DoWork() {
+bool SubprocessSet::DoWork(int control_fd, bool* control_ready) {
   vector<pollfd> fds;
   nfds_t nfds = 0;
+
+  if (control_ready)
+    *control_ready = false;
 
   for (vector<Subprocess*>::iterator i = running_.begin();
        i != running_.end(); ++i) {
@@ -252,6 +258,12 @@ bool SubprocessSet::DoWork() {
     if (fd < 0)
       continue;
     pollfd pfd = { fd, POLLIN | POLLPRI, 0 };
+    fds.push_back(pfd);
+    ++nfds;
+  }
+
+  if (control_fd >= 0) {
+    pollfd pfd = { control_fd, POLLIN | POLLPRI, 0 };
     fds.push_back(pfd);
     ++nfds;
   }
@@ -269,6 +281,10 @@ bool SubprocessSet::DoWork() {
   HandlePendingInterruption();
   if (IsInterrupted())
     return true;
+
+  if (control_fd >= 0 &&
+      (fds.back().revents & (POLLIN | POLLPRI)) != 0 && control_ready)
+    *control_ready = true;
 
   nfds_t cur_nfd = 0;
   for (vector<Subprocess*>::iterator i = running_.begin();
@@ -292,10 +308,13 @@ bool SubprocessSet::DoWork() {
 }
 
 #else  // !defined(USE_PPOLL)
-bool SubprocessSet::DoWork() {
+bool SubprocessSet::DoWork(int control_fd, bool* control_ready) {
   fd_set set;
   int nfds = 0;
   FD_ZERO(&set);
+
+  if (control_ready)
+    *control_ready = false;
 
   for (vector<Subprocess*>::iterator i = running_.begin();
        i != running_.end(); ++i) {
@@ -305,6 +324,11 @@ bool SubprocessSet::DoWork() {
       if (nfds < fd+1)
         nfds = fd+1;
     }
+  }
+  if (control_fd >= 0) {
+    FD_SET(control_fd, &set);
+    if (nfds < control_fd + 1)
+      nfds = control_fd + 1;
   }
 
   interrupted_ = 0;
@@ -320,6 +344,9 @@ bool SubprocessSet::DoWork() {
   HandlePendingInterruption();
   if (IsInterrupted())
     return true;
+
+  if (control_fd >= 0 && FD_ISSET(control_fd, &set) && control_ready)
+    *control_ready = true;
 
   for (vector<Subprocess*>::iterator i = running_.begin();
        i != running_.end(); ) {
@@ -345,6 +372,87 @@ Subprocess* SubprocessSet::NextFinished() {
   Subprocess* subproc = finished_.front();
   finished_.pop();
   return subproc;
+}
+
+bool SubprocessSet::IsRunning(Subprocess* subproc) const {
+  return find(running_.begin(), running_.end(), subproc) != running_.end();
+}
+
+bool SubprocessSet::TerminateForRetry(Subprocess* subproc) {
+  if (!subproc || subproc->use_console_ || !IsRunning(subproc) ||
+      subproc->pid_ <= 0) {
+    return false;
+  }
+  // Every non-console action starts in its own process group. Signal the group,
+  // not just /bin/sh, so ordinary compiler descendants cannot survive retry.
+  if (kill(-subproc->pid_, SIGTERM) < 0 && errno != ESRCH)
+    return false;
+  if (kill(-subproc->pid_, SIGKILL) < 0 && errno != ESRCH)
+    return false;
+  return true;
+}
+
+static bool ReadProcessGroupAndRssKB(pid_t pid, pid_t* process_group,
+                                     uint64_t* rss_kb) {
+  char path[64];
+  snprintf(path, sizeof(path), "/proc/%d/stat", static_cast<int>(pid));
+  FILE* stat = fopen(path, "r");
+  if (!stat)
+    return false;
+  char buffer[4096];
+  size_t size = fread(buffer, 1, sizeof(buffer) - 1, stat);
+  fclose(stat);
+  if (size == 0)
+    return false;
+  buffer[size] = '\0';
+  char* closing = strrchr(buffer, ')');
+  if (!closing)
+    return false;
+  int group;
+  if (sscanf(closing + 2, "%*c %*d %d", &group) != 1)
+    return false;
+
+  snprintf(path, sizeof(path), "/proc/%d/statm", static_cast<int>(pid));
+  FILE* statm = fopen(path, "r");
+  if (!statm)
+    return false;
+  unsigned long resident_pages;
+  bool parsed = fscanf(statm, "%*lu %lu", &resident_pages) == 1;
+  fclose(statm);
+  if (!parsed)
+    return false;
+
+  long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0)
+    return false;
+  *process_group = group;
+  *rss_kb = static_cast<uint64_t>(resident_pages) *
+      static_cast<uint64_t>(page_size) / 1024;
+  return true;
+}
+
+uint64_t SubprocessSet::ProcessGroupRssKB(Subprocess* subproc) const {
+  if (!subproc || subproc->pid_ <= 0)
+    return 0;
+  DIR* proc = opendir("/proc");
+  if (!proc)
+    return 0;
+  uint64_t total = 0;
+  dirent* entry;
+  while ((entry = readdir(proc)) != NULL) {
+    char* end = NULL;
+    long pid = strtol(entry->d_name, &end, 10);
+    if (!end || *end != '\0' || pid <= 0)
+      continue;
+    pid_t group;
+    uint64_t rss_kb;
+    if (ReadProcessGroupAndRssKB(static_cast<pid_t>(pid), &group, &rss_kb) &&
+        group == subproc->pid_) {
+      total += rss_kb;
+    }
+  }
+  closedir(proc);
+  return total;
 }
 
 void SubprocessSet::Clear() {

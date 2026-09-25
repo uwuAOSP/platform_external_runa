@@ -87,6 +87,8 @@ message Status {
     // Arbitrary tags for build system profiling (module names and types, rule
     // names, etc). Format of the string is implementation defined.
     optional string tags = 14;
+    // True if the attempt was canceled and will be retried.
+    optional bool canceled = 15;
   }
 
   message Message {

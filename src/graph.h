@@ -424,12 +424,18 @@ public:
   ///  - Error reporting should be deterministic, and
   ///  - Fatal() destructs static globals, which a worker thread could be using.
   std::string GetBinding(const HashedStrView& key);
+  /// Return a binding without shell escaping path expansions.
+  std::string GetUnescapedBinding(const HashedStrView& key);
   /// Like GetBinding("depfile"), but without shell escaping.
   string GetUnescapedDepfile();
   /// Like GetBinding("dyndep"), but without shell escaping.
   string GetUnescapedDyndep();
   /// Like GetBinding("rspfile"), but without shell escaping.
   string GetUnescapedRspfile();
+
+  /// Whether this action opted in to runtime cancellation and retry.
+  bool IsRetryable();
+  string RetryClass();
 
   void Dump(const char* prefix="") const;
 

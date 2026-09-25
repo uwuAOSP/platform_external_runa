@@ -737,6 +737,33 @@ std::string Edge::GetBinding(const HashedStrView& key) {
   return GetBindingImpl(key, EdgeEval::kFinalScope, EdgeEval::kShellEscape);
 }
 
+std::string Edge::GetUnescapedBinding(const HashedStrView& key) {
+  return GetBindingImpl(key, EdgeEval::kFinalScope, EdgeEval::kDoNotEscape);
+}
+
+bool Edge::IsRetryable() {
+  static const HashedStrView kRunaRetryable { "runa_retryable" };
+  string value = GetBindingImpl(kRunaRetryable, EdgeEval::kFinalScope,
+                                EdgeEval::kDoNotEscape);
+  bool opted_out = value == "0" || value == "false" || value == "no";
+  if (opted_out || is_phony() || use_console() || IsPhonyOutput() ||
+      IsGenerator() || dyndep_ != NULL) {
+    return false;
+  }
+  for (Node* output : outputs_) {
+    if (output->dyndep_pending())
+      return false;
+  }
+  return true;
+}
+
+string Edge::RetryClass() {
+  static const HashedStrView kRunaRetryClass { "runa_retry_class" };
+  string value = GetBindingImpl(kRunaRetryClass, EdgeEval::kFinalScope,
+                                EdgeEval::kDoNotEscape);
+  return value.empty() ? "generic" : value;
+}
+
 std::string Edge::GetUnescapedDepfile() {
   return GetBindingImpl(kDepfile, EdgeEval::kFinalScope, EdgeEval::kDoNotEscape);
 }

@@ -15,6 +15,7 @@
 #ifndef NINJA_SUBPROCESS_H_
 #define NINJA_SUBPROCESS_H_
 
+#include <stdint.h>
 #include <string>
 #include <vector>
 #include <queue>
@@ -92,8 +93,13 @@ struct SubprocessSet {
   ~SubprocessSet();
 
   Subprocess* Add(const EdgeCommand& cmd, int extra_fd = -1);
-  bool DoWork();
+  /// Wait for subprocess activity or for |control_fd| to become readable.
+  /// |control_ready| is set only when the control descriptor caused wakeup.
+  bool DoWork(int control_fd = -1, bool* control_ready = NULL);
   Subprocess* NextFinished();
+  bool IsRunning(Subprocess* subproc) const;
+  bool TerminateForRetry(Subprocess* subproc);
+  uint64_t ProcessGroupRssKB(Subprocess* subproc) const;
   void Clear();
 
   vector<Subprocess*> running_;

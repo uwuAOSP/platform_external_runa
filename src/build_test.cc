@@ -479,6 +479,7 @@ struct FakeCommandRunner : public CommandRunner {
 
   vector<string> commands_ran_;
   vector<Edge*> active_edges_;
+  set<Edge*> retry_edges_;
   size_t max_active_edges_;
   VirtualFileSystem* fs_;
 };
@@ -706,6 +707,13 @@ bool FakeCommandRunner::WaitForCommand(Result* result) {
   Edge* edge = *edge_iter;
   result->edge = edge;
 
+  if (retry_edges_.erase(edge) != 0) {
+    result->status = ExitInterrupted;
+    result->retry = true;
+    active_edges_.erase(edge_iter);
+    return true;
+  }
+
   if (edge->rule().name() == "interrupt" ||
       edge->rule().name() == "touch-interrupt") {
     result->status = ExitInterrupted;
@@ -794,6 +802,58 @@ TEST_F(BuildTest, OneStep) {
 
   ASSERT_EQ(1u, command_runner_.commands_ran_.size());
   EXPECT_EQ("cat in1 > cat1", command_runner_.commands_ran_[0]);
+}
+
+TEST_F(BuildTest, RetryCleansPartialStateAndRequeuesEdge) {
+  ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
+"build retry_out: cat in1\n"
+"  runa_retryable = true\n"
+"  runa_retry_class = compile\n"
+"  runa_retry_cleanup = retry.tmp\n"
+"  depfile = retry_out.d\n"
+"  rspfile = retry_out.rsp\n"
+"  rspfile_content = in1\n"));
+
+  Edge* edge = GetNode("retry_out")->in_edge();
+  ASSERT_TRUE(edge->IsRetryable());
+  EXPECT_EQ("compile", edge->RetryClass());
+  command_runner_.retry_edges_.insert(edge);
+  fs_.Create("retry.tmp", "partial");
+  fs_.Create("retry_out.d", "partial");
+
+  string err;
+  EXPECT_TRUE(builder_.AddTarget("retry_out", &err));
+  ASSERT_EQ("", err);
+  EXPECT_TRUE(builder_.Build(&err));
+  ASSERT_EQ("", err);
+
+  EXPECT_EQ(2u, command_runner_.commands_ran_.size());
+  EXPECT_EQ(1u, fs_.files_.count("retry_out"));
+  EXPECT_EQ(0u, fs_.files_.count("retry.tmp"));
+  EXPECT_EQ(0u, fs_.files_.count("retry_out.d"));
+  EXPECT_EQ(0u, fs_.files_.count("retry_out.rsp"));
+}
+
+TEST_F(BuildTest, RetryDefaultsToOrdinaryActionsAndExcludesUnsafeEdges) {
+  ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
+"rule retry_console\n"
+"  command = true\n"
+"  pool = console\n"
+"  runa_retryable = true\n"
+"rule retry_generator\n"
+"  command = true\n"
+"  generator = true\n"
+"  runa_retryable = true\n"
+"build normal: cat in1\n"
+"build opt_out: cat in1\n"
+"  runa_retryable = false\n"
+"build console_out: retry_console\n"
+"build generator_out: retry_generator\n"));
+
+  EXPECT_TRUE(GetNode("normal")->in_edge()->IsRetryable());
+  EXPECT_FALSE(GetNode("opt_out")->in_edge()->IsRetryable());
+  EXPECT_FALSE(GetNode("console_out")->in_edge()->IsRetryable());
+  EXPECT_FALSE(GetNode("generator_out")->in_edge()->IsRetryable());
 }
 
 TEST_F(BuildTest, OneStep2) {

@@ -45,6 +45,7 @@
 #include "graph.h"
 #include "metrics.h"
 #include "parallel_map.h"
+#include "runtime_control.h"
 #include "state.h"
 #include "status.h"
 #include "subprocess.h"
@@ -188,6 +189,18 @@ Edge* Plan::FindWork() {
   return edge;
 }
 
+void Plan::EstimateRemainingTime(int64_t fallback_edge_time_millis,
+                                int64_t* estimated_time_millis) const {
+  *estimated_time_millis = 0;
+  for (const auto& entry : want_) {
+    Edge* edge = entry.first;
+    if (entry.second == kWantNothing || edge->is_phony())
+      continue;
+    const int64_t edge_time = edge->estimated_time();
+    *estimated_time_millis += edge_time >= 0 ? edge_time : fallback_edge_time_millis;
+  }
+}
+
 void Plan::ScheduleWork(map<Edge*, Want>::iterator want_e) {
   if (want_e->second == kWantToFinish) {
     // This edge has already been scheduled.  We can get here again if an edge
@@ -219,6 +232,14 @@ bool Plan::EdgeFinished(Edge* edge, EdgeResult result, string* err) {
   if (directly_wanted)
     edge->pool()->EdgeFinished(*edge);
   edge->pool()->RetrieveReadyEdges(&ready_);
+
+  if (result == kEdgeRetry) {
+    assert(directly_wanted);
+    assert(e->second == kWantToFinish);
+    e->second = kWantToStart;
+    ScheduleWork(e);
+    return true;
+  }
 
   // The rest of this function only applies to successful commands.
   if (result != kEdgeSucceeded)
@@ -467,17 +488,28 @@ void Plan::Dump() {
 }
 
 struct RealCommandRunner : public CommandRunner {
-  explicit RealCommandRunner(const BuildConfig& config) : config_(config) {}
+  explicit RealCommandRunner(const BuildConfig& config)
+      : config_(config), effective_parallelism_(config.parallelism),
+        successful_edges_(0) {}
   virtual ~RealCommandRunner() {}
   virtual bool CanRunMore();
   virtual bool StartCommand(Edge* edge);
   virtual bool WaitForCommand(Result* result);
+  virtual bool StartControl(const string& path, string* err);
+  virtual void EdgeSucceeded() { ++successful_edges_; }
   virtual vector<Edge*> GetActiveEdges();
   virtual void Abort();
 
+  void HandleControlRequest();
+  bool CancelActionForRetry(Edge** edge, uint64_t* rss_kb, string* err);
+
   const BuildConfig& config_;
+  int effective_parallelism_;
+  uint64_t successful_edges_;
+  RuntimeControl control_;
   SubprocessSet subprocs_;
   map<Subprocess*, Edge*> subproc_to_edge_;
+  set<Subprocess*> retrying_;
 };
 
 vector<Edge*> RealCommandRunner::GetActiveEdges() {
@@ -489,14 +521,102 @@ vector<Edge*> RealCommandRunner::GetActiveEdges() {
 
 void RealCommandRunner::Abort() {
   subprocs_.Clear();
+  retrying_.clear();
 }
 
 bool RealCommandRunner::CanRunMore() {
   size_t subproc_number =
       subprocs_.running_.size() + subprocs_.finished_.size();
-  return (int)subproc_number < config_.parallelism
+  return (int)subproc_number < effective_parallelism_
     && ((subprocs_.running_.empty() || config_.max_load_average <= 0.0f)
         || GetLoadAverage() < config_.max_load_average);
+}
+
+bool RealCommandRunner::StartControl(const string& path, string* err) {
+  return control_.Open(path, err);
+}
+
+bool RealCommandRunner::CancelActionForRetry(Edge** selected_edge,
+                                              uint64_t* selected_rss_kb,
+                                              string* err) {
+  Subprocess* selected = NULL;
+  Edge* edge = NULL;
+  uint64_t rss_kb = 0;
+  for (const pair<Subprocess*, Edge*>& active : subproc_to_edge_) {
+    if (retrying_.find(active.first) != retrying_.end() ||
+        !subprocs_.IsRunning(active.first) || !active.second->IsRetryable()) {
+      continue;
+    }
+    uint64_t candidate_rss_kb = subprocs_.ProcessGroupRssKB(active.first);
+    if (!selected || candidate_rss_kb > rss_kb) {
+      selected = active.first;
+      edge = active.second;
+      rss_kb = candidate_rss_kb;
+    }
+  }
+  if (!selected) {
+    *err = "no_retryable_action";
+    return false;
+  }
+  if (!subprocs_.TerminateForRetry(selected)) {
+    *err = "termination_failed";
+    return false;
+  }
+  retrying_.insert(selected);
+  *selected_edge = edge;
+  *selected_rss_kb = rss_kb;
+  return true;
+}
+
+void RealCommandRunner::HandleControlRequest() {
+  string request;
+  string err;
+  if (!control_.Receive(&request, &err)) {
+    control_.Reply("error reason=invalid_request");
+    return;
+  }
+
+  istringstream input(request);
+  string command;
+  input >> command;
+  if (command == "set_parallelism") {
+    int value = 0;
+    string trailing;
+    if (!(input >> value) || value < 1 || (input >> trailing)) {
+      control_.Reply("error reason=invalid_parallelism");
+      return;
+    }
+    effective_parallelism_ = value;
+    control_.Reply("ok parallelism=" + std::to_string(value));
+  } else if (command == "cancel_action_for_retry") {
+    string trailing;
+    if (input >> trailing) {
+      control_.Reply("error reason=invalid_request");
+      return;
+    }
+    Edge* edge = NULL;
+    uint64_t rss_kb = 0;
+    if (!CancelActionForRetry(&edge, &rss_kb, &err)) {
+      control_.Reply("reject reason=" + err);
+      return;
+    }
+    control_.Reply("ok state=accepted action=" + std::to_string(edge->id_) +
+                   " rss_kb=" + std::to_string(rss_kb));
+  } else if (command == "get_status") {
+    string trailing;
+    if (input >> trailing) {
+      control_.Reply("error reason=invalid_request");
+      return;
+    }
+    control_.Reply("ok parallelism=" + std::to_string(effective_parallelism_) +
+                   " original_parallelism=" +
+                   std::to_string(config_.parallelism) +
+                   " running=" + std::to_string(subproc_to_edge_.size()) +
+                   " retrying=" + std::to_string(retrying_.size()) +
+                   " successful_actions=" + std::to_string(successful_edges_));
+  } else {
+    control_.Reply("error reason=unknown_command");
+  }
 }
 
 bool RealCommandRunner::StartCommand(Edge* edge) {
@@ -512,10 +632,17 @@ bool RealCommandRunner::StartCommand(Edge* edge) {
 
 bool RealCommandRunner::WaitForCommand(Result* result) {
   Subprocess* subproc;
-  while ((subproc = subprocs_.NextFinished()) == NULL) {
-    bool interrupted = subprocs_.DoWork();
+  while (true) {
+    if (control_.HasPendingRequest())
+      HandleControlRequest();
+    if ((subproc = subprocs_.NextFinished()) != NULL)
+      break;
+    bool control_ready = false;
+    bool interrupted = subprocs_.DoWork(control_.fd(), &control_ready);
     if (interrupted)
       return false;
+    if (control_ready)
+      HandleControlRequest();
   }
 
   result->status = subproc->Finish();
@@ -523,6 +650,7 @@ bool RealCommandRunner::WaitForCommand(Result* result) {
   result->rusage = *subproc->GetUsage();
 #endif
   result->output = subproc->GetOutput();
+  result->retry = retrying_.erase(subproc) != 0;
 
   map<Subprocess*, Edge*>::iterator e = subproc_to_edge_.find(subproc);
   result->edge = e->second;
@@ -537,7 +665,10 @@ Builder::Builder(State* state, const BuildConfig& config,
                  DiskInterface* disk_interface, Status* status,
                  int64_t start_time_millis)
     : state_(state), config_(config), plan_(this), status_(status),
-      start_time_millis_(start_time_millis), disk_interface_(disk_interface),
+      start_time_millis_(start_time_millis), critical_time_millis_(0),
+      estimated_edge_time_millis_(0), estimated_history_edges_(0),
+      initial_command_edges_(0), completed_edges_since_estimate_(0),
+      disk_interface_(disk_interface),
       scan_(state, build_log, deps_log, disk_interface,
             &config_.depfile_parser_options, config.uses_phony_outputs) {
 }
@@ -612,6 +743,7 @@ void Builder::RefreshPriority(const std::vector<Node*>& start_nodes) {
   }
   std::vector<std::pair<Edge*, int64_t>> todos;
   std::unordered_set<Edge*> initial_edges;
+  std::unordered_set<Edge*> estimated_edges;
   std::unique_ptr<ThreadPool> thread_pool = CreateThreadPool();
   for (Node* node : start_nodes) {
     Edge* edge = node ? node->in_edge() : nullptr;
@@ -621,6 +753,7 @@ void Builder::RefreshPriority(const std::vector<Node*>& start_nodes) {
   }
 
   struct PriorityResult {
+    Edge* edge;
     int64_t priority;
     std::vector<Edge*> next_edges;
     int64_t estimated_time;
@@ -650,6 +783,7 @@ void Builder::RefreshPriority(const std::vector<Node*>& start_nodes) {
             return edge->estimated_time();
           }
         } else {
+          *estimated_time = edge->estimated_time();
           return edge->estimated_time();
         }
       }
@@ -667,14 +801,14 @@ void Builder::RefreshPriority(const std::vector<Node*>& start_nodes) {
       auto acc = p.second;
 
       if (!e) {
-        return PriorityResult{0, {}, -1};
+        return PriorityResult{nullptr, 0, {}, -1};
       }
       int64_t estimated_time;
       auto run = weight_getter(e, &estimated_time);
       auto new_priority = run + acc;
       // Skip if priority isn't updated
       if (new_priority <= e->priority()) {
-        return PriorityResult{e->priority(), {}, estimated_time};
+        return PriorityResult{e, e->priority(), {}, estimated_time};
       }
       e->priority_ = new_priority;
 
@@ -691,13 +825,16 @@ void Builder::RefreshPriority(const std::vector<Node*>& start_nodes) {
         }
       }
       return PriorityResult{
-          e->priority(), std::move(next_edges), estimated_time};
+          e, e->priority(), std::move(next_edges), estimated_time};
     });
     todos.clear();
 
     std::unordered_map<Edge*, int64_t> next_todo_map_total;
     for (const auto& item : result) {
-      if (item.estimated_time >= 0) {
+      if (item.estimated_time >= 0 && item.edge &&
+          estimated_edges.insert(item.edge).second) {
+        estimated_edge_time_millis_ += item.estimated_time;
+        ++estimated_history_edges_;
         status_->AddEstimatedTime(item.estimated_time);
       }
       if (config_.ninja_log_as_weight_list) {
@@ -716,6 +853,23 @@ void Builder::RefreshPriority(const std::vector<Node*>& start_nodes) {
     }
   }
   status_->SetCriticalPathTime(critical_time_millis_);
+}
+
+void Builder::MaybeRefreshEstimate() {
+  static const int kEstimateRefreshInterval = 500;
+  if (!config_.ninja_log_as_weight_list || initial_command_edges_ <= 0 ||
+      estimated_history_edges_ * 2 <= initial_command_edges_)
+    return;
+  if (++completed_edges_since_estimate_ < kEstimateRefreshInterval)
+    return;
+  completed_edges_since_estimate_ = 0;
+
+  int64_t remaining_estimate = 0;
+  const int64_t average_edge_time = estimated_edge_time_millis_ /
+      std::max<int64_t>(1, estimated_history_edges_);
+  plan_.EstimateRemainingTime(average_edge_time, &remaining_estimate);
+  const int64_t elapsed = GetTimeMillis() - start_time_millis_;
+  status_->UpdateEstimatedTime(elapsed + remaining_estimate);
 }
 
 bool Builder::AddTargets(const std::vector<Node*> &nodes, string* err) {
@@ -763,7 +917,8 @@ bool Builder::AlreadyUpToDate() const {
 bool Builder::Build(string* err) {
   assert(!AlreadyUpToDate());
 
-  status_->PlanHasTotalEdges(plan_.command_edge_count());
+  initial_command_edges_ = plan_.command_edge_count();
+  status_->PlanHasTotalEdges(initial_command_edges_);
   int pending_commands = 0;
   int failures_allowed = config_.failures_allowed;
 
@@ -773,6 +928,9 @@ bool Builder::Build(string* err) {
       command_runner_.reset(new DryRunCommandRunner);
     else
       command_runner_.reset(new RealCommandRunner(config_));
+  }
+  if (!command_runner_->StartControl(config_.control_socket_path, err)) {
+    return false;
   }
 
   // We are about to start the build process.
@@ -812,7 +970,7 @@ bool Builder::Build(string* err) {
     if (pending_commands) {
       CommandRunner::Result result;
       if (!command_runner_->WaitForCommand(&result) ||
-          result.status == ExitInterrupted) {
+          (result.status == ExitInterrupted && !result.retry)) {
         Cleanup();
         status_->BuildFinished();
         *err = "interrupted by user";
@@ -820,6 +978,14 @@ bool Builder::Build(string* err) {
       }
 
       --pending_commands;
+      if (result.retry) {
+        if (!RetryCommand(&result, err)) {
+          Cleanup();
+          status_->BuildFinished();
+          return false;
+        }
+        continue;
+      }
       if (!FinishCommand(&result, err)) {
         Cleanup();
         status_->BuildFinished();
@@ -829,6 +995,8 @@ bool Builder::Build(string* err) {
       if (!result.success()) {
         if (failures_allowed)
           failures_allowed--;
+      } else {
+        command_runner_->EdgeSucceeded();
       }
 
       // We made some progress; start the main loop over.
@@ -851,6 +1019,51 @@ bool Builder::Build(string* err) {
   }
 
   status_->BuildFinished();
+  return true;
+}
+
+bool Builder::RetryCommand(CommandRunner::Result* result, string* err) {
+  METRIC_RECORD("RetryCommand");
+  Edge* edge = result->edge;
+  RunningEdgeMap::iterator running = running_edges_.find(edge);
+  if (running == running_edges_.end()) {
+    *err = "retry action is not recorded as running";
+    return false;
+  }
+  int64_t end_time_millis = GetTimeMillis() - start_time_millis_;
+  running_edges_.erase(running);
+
+  result->status = ExitInterrupted;
+  status_->BuildEdgeFinished(edge, end_time_millis, result);
+
+  set<string> paths;
+  if (!edge->IsPhonyOutput()) {
+    for (Node* output : edge->outputs_)
+      paths.insert(output->globalPath().h.str_view().AsString());
+  }
+  string depfile = edge->GetUnescapedDepfile();
+  if (!depfile.empty())
+    paths.insert(edge->pos_.scope()->GlobalPath(depfile).h.str_view().AsString());
+  string rspfile = edge->GetUnescapedRspfile();
+  if (!rspfile.empty())
+    paths.insert(edge->pos_.scope()->GlobalPath(rspfile).h.str_view().AsString());
+
+  static const HashedStrView kRunaRetryCleanup { "runa_retry_cleanup" };
+  istringstream cleanup(edge->GetUnescapedBinding(kRunaRetryCleanup));
+  string path;
+  while (cleanup >> path)
+    paths.insert(edge->pos_.scope()->GlobalPath(path).h.str_view().AsString());
+
+  for (const string& retry_path : paths) {
+    if (disk_interface_->RemoveFile(retry_path) < 0) {
+      *err = "removing partial retry output '" + retry_path + "': " +
+          strerror(errno);
+      return false;
+    }
+  }
+
+  if (!plan_.EdgeFinished(edge, Plan::kEdgeRetry, err))
+    return false;
   return true;
 }
 
@@ -1052,6 +1265,8 @@ bool Builder::FinishCommand(CommandRunner::Result* result, string* err) {
   if (!result->success()) {
     return true;
   }
+
+  MaybeRefreshEstimate();
 
   // Delete any left over response file.
   string rspfile = edge->GetUnescapedRspfile();

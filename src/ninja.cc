@@ -226,12 +226,12 @@ struct Tool {
 /// Print usage information.
 void Usage(const BuildConfig& config) {
   fprintf(stderr,
-"usage: ninja [options] [targets...]\n"
+"usage: runa [options] [targets...]\n"
 "\n"
 "if targets are unspecified, builds the 'default' target (see manual).\n"
 "\n"
 "options:\n"
-"  --version      print ninja version (\"%s\")\n"
+"  --version      print Runa version (\"%s\")\n"
 "  -v, --verbose  show all command lines while building\n"
 "  --quiet        don't show progress status, just command output\n"
 "\n"
@@ -252,6 +252,7 @@ void Usage(const BuildConfig& config) {
 "\n"
 "  --frontend COMMAND    execute COMMAND and pass serialized build output to it\n"
 "  --frontend_file FILE  write serialized build output to FILE\n"
+"  --control-socket FILE listen for runtime scheduler control requests\n"
 #endif
       , kNinjaVersion, config.parallelism);
 }
@@ -1539,11 +1540,13 @@ int ReadFlags(int* argc, char*** argv,
     OPT_FRONTEND_FILE = 3,
     OPT_QUIET = 4,
     OPT_EXPERIMENTALENVVAR = 5,
+    OPT_CONTROL_SOCKET = 6,
   };
   const option kLongOptions[] = {
 #ifndef _WIN32
     { "frontend", required_argument, NULL, OPT_FRONTEND },
     { "frontend_file", required_argument, NULL, OPT_FRONTEND_FILE },
+    { "control-socket", required_argument, NULL, OPT_CONTROL_SOCKET },
 #endif
     { "help", no_argument, NULL, 'h' },
     { "version", no_argument, NULL, OPT_VERSION },
@@ -1632,6 +1635,9 @@ int ReadFlags(int* argc, char*** argv,
         break;
       case OPT_FRONTEND_FILE:
         config->frontend_file = optarg;
+        break;
+      case OPT_CONTROL_SOCKET:
+        config->control_socket_path = optarg;
         break;
       case OPT_EXPERIMENTALENVVAR:
         options->experimentalEnvvar = true;
