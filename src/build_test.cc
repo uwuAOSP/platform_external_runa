@@ -819,7 +819,7 @@ TEST_F(BuildTest, RetryCleansPartialStateAndRequeuesEdge) {
   EXPECT_EQ("compile", edge->RetryClass());
   command_runner_.retry_edges_.insert(edge);
   fs_.Create("retry.tmp", "partial");
-  fs_.Create("retry_out.d", "partial");
+  fs_.Create("retry_out.d", "retry_out: in1\n");
 
   string err;
   EXPECT_TRUE(builder_.AddTarget("retry_out", &err));
@@ -839,16 +839,16 @@ TEST_F(BuildTest, RetryDefaultsToOrdinaryActionsAndExcludesUnsafeEdges) {
 "rule retry_console\n"
 "  command = true\n"
 "  pool = console\n"
-"  runa_retryable = true\n"
 "rule retry_generator\n"
 "  command = true\n"
 "  generator = true\n"
-"  runa_retryable = true\n"
 "build normal: cat in1\n"
 "build opt_out: cat in1\n"
 "  runa_retryable = false\n"
 "build console_out: retry_console\n"
-"build generator_out: retry_generator\n"));
+"  runa_retryable = true\n"
+"build generator_out: retry_generator\n"
+"  runa_retryable = true\n"));
 
   EXPECT_TRUE(GetNode("normal")->in_edge()->IsRetryable());
   EXPECT_FALSE(GetNode("opt_out")->in_edge()->IsRetryable());
