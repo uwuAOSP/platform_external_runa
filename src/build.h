@@ -176,6 +176,9 @@ struct CommandRunner {
   virtual void Abort() {}
 };
 
+/// Read a runtime limit, retaining the current value on missing/invalid input.
+int ReadParallelismLimit(const std::string& path, int current, int ceiling);
+
 /// Options (e.g. verbosity, parallelism) passed to a build.
 struct BuildConfig {
   BuildConfig() : verbosity(NORMAL), dry_run(false), parallelism(1),
@@ -199,6 +202,8 @@ struct BuildConfig {
   Verbosity verbosity;
   bool dry_run;
   int parallelism;
+  /// Optional runtime admission limit. Running commands are never interrupted.
+  std::string parallelism_file;
   int failures_allowed;
   /// Unix socket used for runtime scheduler control. Empty disables control.
   string control_socket_path;

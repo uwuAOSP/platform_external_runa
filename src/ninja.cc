@@ -239,6 +239,7 @@ void Usage(const BuildConfig& config) {
 "  -f FILE  specify input build file [default=build.ninja]\n"
 "\n"
 "  -j N     run N jobs in parallel (0 means infinity) [default=%d on this system]\n"
+"  --parallelism-file FILE read runtime job limits without interrupting commands\n"
 "  -k N     keep going until N jobs fail (0 means infinity) [default=1]\n"
 "  -l N     do not start new jobs if the load average is greater than N\n"
 "  -n       dry run (don't run commands but act like they succeeded)\n"
@@ -1541,6 +1542,7 @@ int ReadFlags(int* argc, char*** argv,
     OPT_QUIET = 4,
     OPT_EXPERIMENTALENVVAR = 5,
     OPT_CONTROL_SOCKET = 6,
+    OPT_PARALLELISM_FILE = 7,
   };
   const option kLongOptions[] = {
 #ifndef _WIN32
@@ -1553,6 +1555,7 @@ int ReadFlags(int* argc, char*** argv,
     { "verbose", no_argument, NULL, 'v' },
     { "quiet", no_argument, NULL, OPT_QUIET },
     { "experimentalEnvvar", no_argument, NULL, OPT_EXPERIMENTALENVVAR },
+    { "parallelism-file", required_argument, NULL, OPT_PARALLELISM_FILE },
     { NULL, 0, NULL, 0 }
   };
 
@@ -1641,6 +1644,9 @@ int ReadFlags(int* argc, char*** argv,
         break;
       case OPT_EXPERIMENTALENVVAR:
         options->experimentalEnvvar = true;
+        break;
+      case OPT_PARALLELISM_FILE:
+        config->parallelism_file = optarg;
         break;
       case 'h':
       default:

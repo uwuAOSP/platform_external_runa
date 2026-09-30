@@ -16,6 +16,7 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <chrono>
 #include <fstream>
 #include <functional>
 #include <set>
@@ -505,6 +506,7 @@ struct RealCommandRunner : public CommandRunner {
 
   const BuildConfig& config_;
   int effective_parallelism_;
+  std::chrono::steady_clock::time_point next_parallelism_check_;
   uint64_t successful_edges_;
   RuntimeControl control_;
   SubprocessSet subprocs_;
@@ -525,11 +527,29 @@ void RealCommandRunner::Abort() {
 }
 
 bool RealCommandRunner::CanRunMore() {
+  if (!config_.parallelism_file.empty()) {
+    auto now = std::chrono::steady_clock::now();
+    if (now >= next_parallelism_check_) {
+      effective_parallelism_ = ReadParallelismLimit(config_.parallelism_file,
+          effective_parallelism_, config_.parallelism);
+      next_parallelism_check_ = now + std::chrono::milliseconds(100);
+    }
+  }
   size_t subproc_number =
       subprocs_.running_.size() + subprocs_.finished_.size();
   return (int)subproc_number < effective_parallelism_
     && ((subprocs_.running_.empty() || config_.max_load_average <= 0.0f)
         || GetLoadAverage() < config_.max_load_average);
+}
+
+int ReadParallelismLimit(const std::string& path, int current, int ceiling) {
+  std::ifstream input(path);
+  int requested;
+  std::string extra;
+  if (!(input >> requested) || (input >> extra) || requested < 1 ||
+      requested > ceiling)
+    return current;
+  return requested;
 }
 
 bool RealCommandRunner::StartControl(const string& path, string* err) {
@@ -582,7 +602,8 @@ void RealCommandRunner::HandleControlRequest() {
   if (command == "set_parallelism") {
     int value = 0;
     string trailing;
-    if (!(input >> value) || value < 1 || (input >> trailing)) {
+    if (!(input >> value) || value < 1 || value > config_.parallelism ||
+        (input >> trailing)) {
       control_.Reply("error reason=invalid_parallelism");
       return;
     }
