@@ -512,9 +512,22 @@ bool DependencyScan::RecomputeOutputDirty(Edge* edge,
         return true;
       }
     }
-    if (!entry && !generator && !g_assume_existing) {
-      EXPLAIN("command line not found in log for %s", output->globalPath().h.data());
-      return true;
+    if (!entry && !generator) {
+      bool api_output = false;
+      if (g_assume_existing) {
+        const string output_path = output->globalPath().h.str_view().AsString();
+        api_output = output_path.find("/.intermediates/") != string::npos &&
+            (output_path.find("/api/") != string::npos ||
+             output_path.find("_api.txt") != string::npos ||
+             output_path.find("_removed.txt") != string::npos ||
+             output_path.find("check_current_api.timestamp") != string::npos ||
+             output_path.find("check_last_released_api.timestamp") != string::npos ||
+             output_path.find("api_lint.timestamp") != string::npos);
+      }
+      if (!g_assume_existing || api_output) {
+        EXPLAIN("command line not found in log for %s", output->globalPath().h.data());
+        return true;
+      }
     }
   }
 

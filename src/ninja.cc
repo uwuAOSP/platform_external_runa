@@ -1206,7 +1206,7 @@ bool DebugEnable(const string& name) {
 "  explain      explain what caused a command to execute\n"
 "  keepdepfile  don't delete depfiles after they're read by ninja\n"
 "  keeprsp      don't delete @response files on success\n"
-"  assumeexisting trust existing outputs with missing build log entries\n"
+"  assumeexisting trust existing outputs with missing build log entries, except API validation outputs\n"
 #ifdef _WIN32
 "  nostatcache  don't batch stat() calls per directory and cache them\n"
 #endif
