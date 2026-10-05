@@ -83,7 +83,6 @@ class NinjaNativeFrontend:
 
         if msg.HasField('edge_finished'):
             handled = True
-            self.finished_edges += 1
             self.time_millis = msg.edge_finished.end_time
 
             edge_started = self.running[msg.edge_finished.id]
@@ -91,11 +90,19 @@ class NinjaNativeFrontend:
             if edge_started.console:
                 self.printer.set_console_locked(False)
 
-            if not edge_started.console:
+            if not edge_started.console and not msg.edge_finished.canceled:
                 self.print_status(edge_started)
 
             self.running_edges -= 1
             del self.running[msg.edge_finished.id]
+
+            if msg.edge_finished.canceled:
+                # A canceled edge will be started again. Do not report the
+                # abandoned attempt as completed or failed.
+                self.started_edges -= 1
+                return
+
+            self.finished_edges += 1
 
             # Print the command that is spewing before printing its output.
             if msg.edge_finished.status != 0:
