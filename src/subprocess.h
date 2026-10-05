@@ -78,7 +78,10 @@ struct Subprocess {
 #else
   int fd_;
   pid_t pid_;
+  pid_t process_group_;
   struct rusage rusage_;
+  bool has_exit_status_;
+  int exit_status_;
 #endif
   bool use_console_;
 
@@ -110,16 +113,20 @@ struct SubprocessSet {
   static HANDLE ioport_;
 #else
   static void SetInterruptedFlag(int signum);
+  static void SetChildExitedFlag(int signum);
   static void HandlePendingInterruption();
+  void ReapExitedChildren();
   /// Store the signal number that causes the interruption.
   /// 0 if not interruption.
   static int interrupted_;
+  static volatile sig_atomic_t child_exited_;
 
   static bool IsInterrupted() { return interrupted_ != 0; }
 
   struct sigaction old_int_act_;
   struct sigaction old_term_act_;
   struct sigaction old_hup_act_;
+  struct sigaction old_chld_act_;
   sigset_t old_mask_;
 #endif
 };

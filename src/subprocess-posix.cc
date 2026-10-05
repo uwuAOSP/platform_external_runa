@@ -33,6 +33,9 @@ extern char** environ;
 #include "util.h"
 
 Subprocess::Subprocess(bool use_console) : fd_(-1), pid_(-1),
+                                           process_group_(-1),
+                                           has_exit_status_(false),
+                                           exit_status_(0),
                                            use_console_(use_console) {
 }
 
@@ -124,6 +127,8 @@ bool Subprocess::Start(SubprocessSet* set, const EdgeCommand& cmd,
         const_cast<char**>(spawned_args), cmd.env ? cmd.env : environ);
   if (err != 0)
     Fatal("posix_spawn: %s", strerror(err));
+  if (!use_console_)
+    process_group_ = pid_;
 
   err = posix_spawnattr_destroy(&attr);
   if (err != 0)
@@ -154,10 +159,13 @@ const struct rusage* Subprocess::GetUsage() const {
 }
 
 ExitStatus Subprocess::Finish() {
-  assert(pid_ != -1);
+  assert(pid_ != -1 || has_exit_status_);
   int status;
-  if (wait4(pid_, &status, 0, &rusage_) < 0)
+  if (has_exit_status_) {
+    status = exit_status_;
+  } else if (wait4(pid_, &status, 0, &rusage_) < 0) {
     Fatal("wait4(%d): %s", pid_, strerror(errno));
+  }
   pid_ = -1;
 
   if (WIFEXITED(status)) {
@@ -181,9 +189,63 @@ const string& Subprocess::GetOutput() const {
 }
 
 int SubprocessSet::interrupted_;
+volatile sig_atomic_t SubprocessSet::child_exited_;
 
 void SubprocessSet::SetInterruptedFlag(int signum) {
   interrupted_ = signum;
+}
+
+void SubprocessSet::SetChildExitedFlag(int signum) {
+  child_exited_ = signum;
+}
+
+void SubprocessSet::ReapExitedChildren() {
+  if (!child_exited_)
+    return;
+  child_exited_ = 0;
+
+  while (true) {
+    int status;
+    struct rusage usage;
+    pid_t pid = wait4(-1, &status, WNOHANG, &usage);
+    if (pid == 0)
+      return;
+    if (pid < 0) {
+      if (errno == EINTR)
+        continue;
+      if (errno == ECHILD)
+        return;
+      Fatal("wait4(-1): %s", strerror(errno));
+    }
+
+    Subprocess* owner = NULL;
+    for (Subprocess* subproc : running_) {
+      if (subproc->pid_ == pid) {
+        owner = subproc;
+        break;
+      }
+    }
+    if (!owner) {
+      queue<Subprocess*> finished = finished_;
+      while (!finished.empty()) {
+        Subprocess* subproc = finished.front();
+        finished.pop();
+        if (subproc->pid_ == pid) {
+          owner = subproc;
+          break;
+        }
+      }
+    }
+    if (owner) {
+      owner->has_exit_status_ = true;
+      owner->exit_status_ = status;
+      owner->rusage_ = usage;
+      owner->pid_ = -1;
+    }
+    // A process not owned by a Subprocess is an orphaned descendant (for
+    // example, a make worker adopted by runa after its shell was killed).
+    // It is now reaped; continue in case more children exited together.
+  }
 }
 
 void SubprocessSet::HandlePendingInterruption() {
@@ -202,11 +264,13 @@ void SubprocessSet::HandlePendingInterruption() {
 }
 
 SubprocessSet::SubprocessSet() {
+  child_exited_ = 0;
   sigset_t set;
   sigemptyset(&set);
   sigaddset(&set, SIGINT);
   sigaddset(&set, SIGTERM);
   sigaddset(&set, SIGHUP);
+  sigaddset(&set, SIGCHLD);
   if (sigprocmask(SIG_BLOCK, &set, &old_mask_) < 0)
     Fatal("sigprocmask: %s", strerror(errno));
 
@@ -219,6 +283,9 @@ SubprocessSet::SubprocessSet() {
     Fatal("sigaction: %s", strerror(errno));
   if (sigaction(SIGHUP, &act, &old_hup_act_) < 0)
     Fatal("sigaction: %s", strerror(errno));
+  act.sa_handler = SetChildExitedFlag;
+  if (sigaction(SIGCHLD, &act, &old_chld_act_) < 0)
+    Fatal("sigaction: %s", strerror(errno));
 }
 
 SubprocessSet::~SubprocessSet() {
@@ -229,6 +296,8 @@ SubprocessSet::~SubprocessSet() {
   if (sigaction(SIGTERM, &old_term_act_, 0) < 0)
     Fatal("sigaction: %s", strerror(errno));
   if (sigaction(SIGHUP, &old_hup_act_, 0) < 0)
+    Fatal("sigaction: %s", strerror(errno));
+  if (sigaction(SIGCHLD, &old_chld_act_, 0) < 0)
     Fatal("sigaction: %s", strerror(errno));
   if (sigprocmask(SIG_SETMASK, &old_mask_, 0) < 0)
     Fatal("sigprocmask: %s", strerror(errno));
@@ -246,6 +315,8 @@ Subprocess *SubprocessSet::Add(const EdgeCommand& cmd, int extra_fd) {
 
 #ifdef USE_PPOLL
 bool SubprocessSet::DoWork(int control_fd, bool* control_ready) {
+  ReapExitedChildren();
+
   vector<pollfd> fds;
   nfds_t nfds = 0;
 
@@ -275,7 +346,11 @@ bool SubprocessSet::DoWork(int control_fd, bool* control_ready) {
       perror("ninja: ppoll");
       return false;
     }
-    return IsInterrupted();
+    HandlePendingInterruption();
+    if (IsInterrupted())
+      return true;
+    ReapExitedChildren();
+    return false;
   }
 
   HandlePendingInterruption();
@@ -304,11 +379,14 @@ bool SubprocessSet::DoWork(int control_fd, bool* control_ready) {
     ++i;
   }
 
+  ReapExitedChildren();
   return IsInterrupted();
 }
 
 #else  // !defined(USE_PPOLL)
 bool SubprocessSet::DoWork(int control_fd, bool* control_ready) {
+  ReapExitedChildren();
+
   fd_set set;
   int nfds = 0;
   FD_ZERO(&set);
@@ -338,7 +416,11 @@ bool SubprocessSet::DoWork(int control_fd, bool* control_ready) {
       perror("ninja: pselect");
       return false;
     }
-    return IsInterrupted();
+    HandlePendingInterruption();
+    if (IsInterrupted())
+      return true;
+    ReapExitedChildren();
+    return false;
   }
 
   HandlePendingInterruption();
@@ -362,6 +444,7 @@ bool SubprocessSet::DoWork(int control_fd, bool* control_ready) {
     ++i;
   }
 
+  ReapExitedChildren();
   return IsInterrupted();
 }
 #endif  // !defined(USE_PPOLL)
@@ -380,14 +463,14 @@ bool SubprocessSet::IsRunning(Subprocess* subproc) const {
 
 bool SubprocessSet::TerminateForRetry(Subprocess* subproc) {
   if (!subproc || subproc->use_console_ || !IsRunning(subproc) ||
-      subproc->pid_ <= 0) {
+      subproc->process_group_ <= 0) {
     return false;
   }
   // Every non-console action starts in its own process group. Signal the group,
   // not just /bin/sh, so ordinary compiler descendants cannot survive retry.
-  if (kill(-subproc->pid_, SIGTERM) < 0 && errno != ESRCH)
+  if (kill(-subproc->process_group_, SIGTERM) < 0 && errno != ESRCH)
     return false;
-  if (kill(-subproc->pid_, SIGKILL) < 0 && errno != ESRCH)
+  if (kill(-subproc->process_group_, SIGKILL) < 0 && errno != ESRCH)
     return false;
   return true;
 }
@@ -432,7 +515,7 @@ static bool ReadProcessGroupAndRssKB(pid_t pid, pid_t* process_group,
 }
 
 uint64_t SubprocessSet::ProcessGroupRssKB(Subprocess* subproc) const {
-  if (!subproc || subproc->pid_ <= 0)
+  if (!subproc || subproc->process_group_ <= 0)
     return 0;
   DIR* proc = opendir("/proc");
   if (!proc)
@@ -447,7 +530,7 @@ uint64_t SubprocessSet::ProcessGroupRssKB(Subprocess* subproc) const {
     pid_t group;
     uint64_t rss_kb;
     if (ReadProcessGroupAndRssKB(static_cast<pid_t>(pid), &group, &rss_kb) &&
-        group == subproc->pid_) {
+        group == subproc->process_group_) {
       total += rss_kb;
     }
   }
@@ -460,8 +543,8 @@ void SubprocessSet::Clear() {
        i != running_.end(); ++i)
     // Since the foreground process is in our process group, it will receive
     // the interruption signal (i.e. SIGINT or SIGTERM) at the same time as us.
-    if (!(*i)->use_console_)
-      kill(-(*i)->pid_, interrupted_);
+    if (!(*i)->use_console_ && (*i)->process_group_ > 0)
+      kill(-(*i)->process_group_, interrupted_);
   for (vector<Subprocess*>::iterator i = running_.begin();
        i != running_.end(); ++i)
     delete *i;

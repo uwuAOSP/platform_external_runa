@@ -19,9 +19,14 @@
 #ifndef _WIN32
 // SetWithLots need setrlimit.
 #include <stdio.h>
+#include <errno.h>
 #include <sys/time.h>
 #include <sys/resource.h>
+#include <sys/wait.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #endif
 
 namespace {
@@ -130,6 +135,36 @@ TEST_F(SubprocessTest, TerminateProcessGroupForRetry) {
 
   EXPECT_NE(ExitSuccess, subproc->Finish());
 }
+
+#ifdef __linux__
+TEST_F(SubprocessTest, ReapsAdoptedDescendants) {
+  int was_subreaper = 0;
+  ASSERT_EQ(0, prctl(PR_GET_CHILD_SUBREAPER, &was_subreaper, 0, 0, 0));
+  ASSERT_EQ(0, prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0));
+
+  EdgeCommand c;
+  c.command = "sleep 0.2 & exit 0";
+  Subprocess* subproc = subprocs_.Add(c);
+  ASSERT_NE((Subprocess*) 0, subproc);
+
+  EdgeCommand blocker_command;
+  blocker_command.command = "sleep 0.6";
+  Subprocess* blocker = subprocs_.Add(blocker_command);
+  ASSERT_NE((Subprocess*) 0, blocker);
+
+  while (!subproc->Done() || !blocker->Done())
+    subprocs_.DoWork();
+
+  EXPECT_EQ(ExitSuccess, subproc->Finish());
+  EXPECT_EQ(ExitSuccess, blocker->Finish());
+  int status;
+  errno = 0;
+  pid_t remaining_child = waitpid(-1, &status, WNOHANG);
+  EXPECT_EQ(-1, remaining_child);
+  EXPECT_EQ(ECHILD, errno);
+  EXPECT_EQ(0, prctl(PR_SET_CHILD_SUBREAPER, was_subreaper, 0, 0, 0));
+}
+#endif
 
 TEST_F(SubprocessTest, InterruptParentWithSigTerm) {
   EdgeCommand c;
