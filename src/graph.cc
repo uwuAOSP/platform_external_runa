@@ -303,6 +303,8 @@ bool DependencyScan::RecomputeNodeDirty(Node* node, std::vector<Node*>* stack,
   // cycle detector if the validation node depends on this node.
   // RecomputeNodesDirty will add the validation nodes to the initial nodes
   // and recurse into them.
+  validation_output_nodes_.insert(edge->validations_.begin(),
+                                  edge->validations_.end());
   validation_nodes->insert(validation_nodes->end(),
       edge->validations_.begin(), edge->validations_.end());
 
@@ -458,10 +460,39 @@ bool DependencyScan::RecomputeOutputDirty(Edge* edge,
 
   BuildLog::LogEntry* entry = 0;
 
-  // Dirty if we're missing the output.
+  // Dirty if we're missing the output. Validation outputs are different:
+  // they gate an edge but are not consumed as files. If a prior successful
+  // validation is recorded in the build log, and its command and inputs are
+  // still current, a deleted stamp does not require rerunning the validation.
+  // This keeps missing Soong API-check stamps from repeatedly rebuilding
+  // expensive API stub graphs while preserving checks after any input change.
   if (!output->exists()) {
+    if (validation_output_nodes_.find(output) != validation_output_nodes_.end() &&
+        build_log()) {
+      BuildLog::LogEntry* entry =
+          build_log()->LookupByOutput(output->globalPath());
+      if (entry && command_hash == entry->command_hash &&
+          (!most_recent_input || entry->mtime >= most_recent_input->mtime())) {
+        EXPLAIN("validation output %s is missing, but its logged command is current",
+                output->globalPath().h.data());
+        return false;
+      }
+    }
     EXPLAIN("output %s doesn't exist", output->globalPath().h.data());
     return true;
+  }
+
+  if (build_log()) {
+    entry = build_log()->LookupByOutput(output->globalPath());
+    // Older build logs may only have an entry for the explicit output of a
+    // multi-output restat edge. This is common when another Ninja-compatible
+    // executor produced the implicit outputs before Runa took over. A restat
+    // timestamp applies to the whole edge, so use the primary output's log
+    // entry for an implicit output that has no separate entry of its own.
+    if (!entry && edge->IsRestat() && edge->explicit_outs_ > 0 &&
+        output != edge->outputs_[0]) {
+      entry = build_log()->LookupByOutput(edge->outputs_[0]->globalPath());
+    }
   }
 
   // Dirty if the output is older than the input.
@@ -473,8 +504,7 @@ bool DependencyScan::RecomputeOutputDirty(Edge* edge,
     // build log.  Use that mtime instead, so that the file will only be
     // considered dirty if an input was modified since the previous run.
     bool used_restat = false;
-    if (edge->IsRestat() && build_log() &&
-        (entry = build_log()->LookupByOutput(output->globalPath()))) {
+    if (edge->IsRestat() && entry) {
       output_mtime = entry->mtime;
       used_restat = true;
       output->set_restat_mtime(output_mtime);
@@ -492,7 +522,7 @@ bool DependencyScan::RecomputeOutputDirty(Edge* edge,
 
   if (build_log()) {
     bool generator = edge->IsGenerator();
-    if (entry || (entry = build_log()->LookupByOutput(output->globalPath()))) {
+    if (entry) {
       if (!generator &&
           command_hash != entry->command_hash) {
         // May also be dirty due to the command changing since the last build.

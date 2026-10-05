@@ -1597,6 +1597,71 @@ TEST_F(BuildWithLogTest, RestatTest) {
   ASSERT_EQ(2u, command_runner_.commands_ran_.size());
 }
 
+TEST_F(BuildWithLogTest, RestatImplicitOutputUsesPrimaryLogEntry) {
+  ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
+"rule multi\n"
+"  command = multi\n"
+"  restat = 1\n"
+"build out | out.imp: multi in\n"));
+
+  fs_.Create("out", "");
+  fs_.Create("out.imp", "");
+  fs_.Tick();
+  fs_.Create("in", "");
+
+  Edge* edge = GetNode("out")->in_edge();
+  ASSERT_EQ(2u, edge->outputs_.size());
+  std::vector<Node*> outputs = edge->outputs_;
+  edge->outputs_.resize(1);
+  string err;
+  const TimeStamp input_mtime = fs_.Stat("in", &err);
+  ASSERT_NE(-1, input_mtime);
+  ASSERT_TRUE(build_log_.RecordCommand(edge, 1, 2, input_mtime));
+  edge->outputs_ = std::move(outputs);
+
+  ASSERT_TRUE(builder_.AddTarget("out.imp", &err));
+  EXPECT_TRUE(builder_.AlreadyUpToDate());
+  EXPECT_EQ(0u, command_runner_.commands_ran_.size());
+}
+
+TEST_F(BuildWithLogTest, MissingValidationOutputUsesCurrentLogEntry) {
+  ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
+"build out: cat in |@ validate\n"
+"build validate: cat in2\n"));
+
+  fs_.Create("in", "");
+  fs_.Create("in2", "");
+  fs_.Create("out", "");
+  fs_.Create("validate", "");
+
+  Edge* validation_edge = GetNode("validate")->in_edge();
+  ASSERT_NE(nullptr, validation_edge);
+  Edge* output_edge = GetNode("out")->in_edge();
+  ASSERT_NE(nullptr, output_edge);
+  string err;
+  const TimeStamp input_mtime = fs_.Stat("in", &err);
+  ASSERT_NE(-1, input_mtime);
+  ASSERT_TRUE(build_log_.RecordCommand(output_edge, 1, 2, input_mtime));
+  const TimeStamp validation_input_mtime = fs_.Stat("in2", &err);
+  ASSERT_NE(-1, validation_input_mtime);
+  ASSERT_TRUE(build_log_.RecordCommand(validation_edge, 1, 2,
+                                       validation_input_mtime));
+  fs_.RemoveFile("validate");
+
+  ASSERT_TRUE(builder_.AddTarget("out", &err));
+  EXPECT_TRUE(builder_.AlreadyUpToDate());
+  EXPECT_EQ(0u, command_runner_.commands_ran_.size());
+
+  // A changed validation input must still schedule the validation edge.
+  fs_.Tick();
+  fs_.Create("in2", "");
+  command_runner_.commands_ran_.clear();
+  state_.Reset();
+  ASSERT_TRUE(builder_.AddTarget("out", &err));
+  ASSERT_TRUE(builder_.Build(&err));
+  EXPECT_EQ(1u, command_runner_.commands_ran_.size());
+}
+
 TEST_F(BuildWithLogTest, RestatMissingFile) {
   // If a restat rule doesn't create its output, and the output didn't
   // exist before the rule was run, consider that behavior equivalent

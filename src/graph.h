@@ -674,6 +674,7 @@ struct DependencyScan {
   DiskInterface* disk_interface_;
   ImplicitDepLoader dep_loader_;
   DyndepLoader dyndep_loader_;
+  std::set<Node*> validation_output_nodes_;
 
   bool missing_phony_is_err_;
 };
