@@ -34,6 +34,7 @@ struct ManifestParserOptions {
   DupeEdgeAction dupe_edge_action_ = kDupeEdgeActionWarn;
   PhonyCycleAction phony_cycle_action_ = kPhonyCycleActionWarn;
   bool experimentalEnvvar = false;
+  bool uni_source_globs = false;
 };
 
 struct ManifestParser {

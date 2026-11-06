@@ -1752,6 +1752,8 @@ NORETURN void real_main(int argc, char** argv) {
       parser_opts.phony_cycle_action_ = kPhonyCycleActionError;
     }
     parser_opts.experimentalEnvvar = options.experimentalEnvvar;
+    const char* uni_state_file = getenv("UNI_STATE_FILE");
+    parser_opts.uni_source_globs = uni_state_file && *uni_state_file;
     ManifestParser parser(&ninja.state_, &ninja.disk_interface_, parser_opts);
     string err;
     if (!parser.Load(options.input_file, &err)) {
