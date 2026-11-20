@@ -24,6 +24,43 @@
 #include "state.h"
 #include "test.h"
 
+TEST(GraphDeltaTest, ReplacesBeforeLinkingAdjacency) {
+  State state;
+  ManifestParserOptions options;
+  GraphDeltaOperation op;
+  op.kind = GraphDeltaOperation::Replace;
+  op.output = "out";
+  op.edge.context_output = "out";
+  op.edge.rule = "copy";
+  op.edge.outputs = {"out"};
+  op.edge.inputs = {"new"};
+  options.graph_delta.push_back(op);
+  ManifestParser parser(&state, nullptr, options);
+  std::string err;
+  ASSERT_TRUE(parser.ParseTest("rule copy\n  command = cp $in $out\nbuild out: copy old\n", &err));
+  ASSERT_EQ(1u, state.edges_.size());
+  EXPECT_EQ("new", state.edges_[0]->inputs_[0]->path());
+  EXPECT_TRUE(state.LookupNode(state.root_scope_.GlobalPath("old"))->GetOutEdges().empty());
+  EXPECT_EQ(1u, state.LookupNode(state.root_scope_.GlobalPath("new"))->GetOutEdges().size());
+  VerifyGraph(state);
+}
+
+TEST(GraphDeltaTest, RejectsConflictingOutputs) {
+  State state;
+  ManifestParserOptions options;
+  GraphDeltaOperation op;
+  op.kind = GraphDeltaOperation::Add;
+  op.output = "new";
+  op.edge.context_output = "old";
+  op.edge.rule = "phony";
+  op.edge.outputs = {"new", "old"};
+  options.graph_delta.push_back(op);
+  ManifestParser parser(&state, nullptr, options);
+  std::string err;
+  EXPECT_FALSE(parser.ParseTest("build old: phony\n", &err));
+  EXPECT_EQ("graph delta: multiple producers in resulting graph", err);
+}
+
 namespace {
 
 std::string EncodeSourceSetForTest(const std::string& value) {

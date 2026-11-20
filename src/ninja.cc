@@ -1763,6 +1763,11 @@ NORETURN void real_main(int argc, char** argv) {
     parser_opts.experimentalEnvvar = options.experimentalEnvvar;
     const char* uni_state_file = getenv("UNI_STATE_FILE");
     parser_opts.uni_source_globs = options.source_globs || (uni_state_file && *uni_state_file);
+    // Explicit GD1 remains available for other callers, but Uni uses only the
+    // source-set declarations in its manifest, never a stale sidecar delta.
+    const char* graph_delta_file = getenv("RUNA_GRAPH_DELTA_FILE");
+    if (!parser_opts.uni_source_globs && graph_delta_file && *graph_delta_file)
+      parser_opts.graph_delta_file = graph_delta_file;
     ManifestParser parser(&ninja.state_, &ninja.disk_interface_, parser_opts);
     string err;
     if (!parser.Load(options.input_file, &err)) {

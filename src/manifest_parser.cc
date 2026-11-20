@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fnmatch.h>
+#include <fstream>
 #include <map>
 #include <set>
 #include <sstream>
@@ -104,6 +105,54 @@ static bool DecodeBase64(const std::string& encoded, std::string* decoded) {
   return bits == -4 || bits == -6 || bits == -8;
 }
 
+static std::string GraphDeltaDigest(StringPiece content) {
+  const uint64_t seeds[] = {
+      1469598103934665603ULL, 1099511628211ULL,
+      7809847782465536322ULL, 9650029242287828579ULL};
+  std::string result;
+  for (uint64_t seed : seeds) {
+    uint64_t hash = seed;
+    for (unsigned char byte : content) {
+      hash ^= byte;
+      hash *= 1099511628211ULL;
+    }
+    char encoded[17];
+    snprintf(encoded, sizeof(encoded), "%016llx",
+             static_cast<unsigned long long>(hash));
+    result += encoded;
+  }
+  return result;
+}
+
+static void AppendGraphDigestField(std::string* data, const std::string& value) {
+  *data += std::to_string(value.size()) + ":" + value + "\n";
+}
+
+static std::string GraphDeltaEdgeDigest(const Edge* edge) {
+  std::string data;
+  AppendGraphDigestField(&data, edge->rule_->name());
+  auto append_nodes = [&data](const std::vector<Node*>& nodes) {
+    AppendGraphDigestField(&data, std::to_string(nodes.size()));
+    for (Node* node : nodes) AppendGraphDigestField(&data, node->globalPath().h.str_view().AsString());
+  };
+  append_nodes(edge->outputs_);
+  append_nodes(edge->inputs_);
+  append_nodes(edge->validations_);
+  // The input vector stores explicit, implicit and order-only inputs in that
+  // order. Keep the category counts in the canonical payload so a replace
+  // cannot accidentally accept an edge with a different dependency class.
+  AppendGraphDigestField(&data, std::to_string(edge->explicit_outs_));
+  AppendGraphDigestField(&data, std::to_string(edge->implicit_outs_));
+  AppendGraphDigestField(&data, std::to_string(edge->explicit_deps_));
+  AppendGraphDigestField(&data, std::to_string(edge->implicit_deps_));
+  AppendGraphDigestField(&data, std::to_string(edge->order_only_deps_));
+  for (const auto& binding : edge->unevaled_bindings_) {
+    AppendGraphDigestField(&data, binding.first.str());
+    AppendGraphDigestField(&data, binding.second);
+  }
+  return GraphDeltaDigest(data);
+}
+
 static void ReserveSpaceInScopeTables(Scope* scope,
                                       const std::vector<ParserItem>& items) {
   // Reserve extra space in the scope's bindings/rules hash tables.
@@ -137,6 +186,14 @@ struct ManifestFileSet {
   bool Getcwd(std::string* out_path, std::string* err);
   bool Chdir(const std::string dir, std::string* err);
   std::vector<std::string> GetFileNames();
+  std::string GraphDigest() const {
+    if (loaded_files_.size() == 1)
+      return GraphDeltaDigest(loaded_files_[0]->content());
+    std::string data = "GD1-manifest-tree\n";
+    for (const auto& file : loaded_files_)
+      AppendGraphDigestField(&data, GraphDeltaDigest(file->content()));
+    return GraphDeltaDigest(data);
+  }
 
 private:
   FileReader *file_reader_ = nullptr;
@@ -465,6 +522,200 @@ static const HashedStrView kTags { "tags" };
 
 // Prepare every replacement before changing the clump edge lists. No adjacency
 // has been published at this point, so deleted edges cannot leave stale links.
+static bool ApplyGraphDelta(State* state, const std::vector<Clump*>& clumps,
+                            const std::vector<GraphDeltaOperation>& operations,
+                            std::string* err) {
+  if (operations.empty()) return true;
+  auto fail = [&](const std::string& message) {
+    *err = "graph delta: " + message;
+    return false;
+  };
+  std::map<std::string, Edge*> producers;
+  std::map<Edge*, Clump*> owners;
+  for (Clump* clump : clumps) {
+    for (Edge* edge : clump->edges_) {
+      owners[edge] = clump;
+      for (Node* node : edge->outputs_) {
+        if (!producers.emplace(node->globalPath().h.str_view().AsString(), edge).second)
+          return fail("ambiguous base output");
+      }
+    }
+  }
+  std::set<Edge*> removed;
+  std::set<std::string> ids;
+  std::vector<std::pair<Clump*, std::unique_ptr<Edge>>> prepared;
+  for (const auto& op : operations) {
+    if (op.output.empty() || !ids.insert(op.output).second)
+      return fail("empty or repeated operation identity");
+    auto old = producers.find(op.output);
+    if (op.kind == GraphDeltaOperation::Add) {
+      if (old != producers.end()) return fail("addition already exists: " + op.output);
+    } else {
+      if (old == producers.end() || !removed.insert(old->second).second)
+        return fail("missing or repeatedly modified edge: " + op.output);
+      if (!op.expected_digest.empty() && GraphDeltaEdgeDigest(old->second) != op.expected_digest)
+        return fail("stale edge digest: " + op.output);
+    }
+    if (op.kind == GraphDeltaOperation::Remove) continue;
+    auto context = producers.find(op.edge.context_output);
+    if (context == producers.end()) return fail("missing context edge");
+    Edge* anchor = context->second;
+    std::unique_ptr<Edge> edge(new Edge());
+    edge->pos_ = anchor->pos_;
+    edge->onPosResolvedToScope(anchor->pos_.scope());
+    edge->rule_ = Scope::LookupRuleAtPos(op.edge.rule, edge->pos_.scope_pos());
+    if (!edge->rule_) return fail("unknown rule: " + op.edge.rule);
+    std::set<std::string> keys;
+    for (const auto& binding : op.edge.bindings) {
+      if (binding.first.empty() || !keys.insert(binding.first).second)
+        return fail("empty or repeated binding");
+      edge->unevaled_bindings_.emplace_back(HashedStr(binding.first), binding.second);
+    }
+    auto paths = [&](const std::vector<std::string>& source, std::vector<Node*>* dest) {
+      for (const auto& path : source) {
+        std::string canonical = path;
+        uint64_t bits = 0;
+        if (path.empty() || !CanonicalizePath(&canonical, &bits, err)) return false;
+        Node* node = state->GetNode(edge->pos_.scope()->GlobalPath(canonical), bits);
+        node->UpdateFirstReference(edge->dfs_location(), bits);
+        dest->push_back(node);
+      }
+      return true;
+    };
+    if (!paths(op.edge.outputs, &edge->outputs_) ||
+        !paths(op.edge.implicit_outputs, &edge->outputs_) ||
+        !paths(op.edge.inputs, &edge->inputs_) ||
+        !paths(op.edge.implicit_inputs, &edge->inputs_) ||
+        !paths(op.edge.order_only_inputs, &edge->inputs_) ||
+        !paths(op.edge.validations, &edge->validations_)) return false;
+    if (edge->outputs_.empty()) return fail("edge has no outputs");
+    bool has_identity = false;
+    for (Node* output : edge->outputs_)
+      has_identity |= output->globalPath().h.str_view().AsString() == op.output;
+    if (op.kind == GraphDeltaOperation::Add && !has_identity)
+      return fail("edge payload does not contain its identity output");
+    edge->explicit_outs_ = op.edge.outputs.size();
+    edge->implicit_outs_ = op.edge.implicit_outputs.size();
+    edge->explicit_deps_ = op.edge.inputs.size();
+    edge->implicit_deps_ = op.edge.implicit_inputs.size();
+    edge->order_only_deps_ = op.edge.order_only_inputs.size();
+    edge->validation_deps_ = op.edge.validations.size();
+    std::string pool;
+    if (!edge->EvaluateVariable(&pool, kPool, edge->pos_.scope(), err, EdgeEval::kParseTime)) return false;
+    edge->pool_ = pool.empty() ? &State::kDefaultPool :
+        state->LookupPoolAtPos(pool, edge->pos_.scope_pos(), edge->dfs_location());
+    if (!edge->pool_) return fail("unknown pool: " + pool);
+    // Dyndep requires additional initialization; reject rather than silently
+    // dropping dynamic dependencies until the wire protocol supports it.
+    std::string dyndep;
+    if (!edge->EvaluateVariable(&dyndep, kDyndep, edge->pos_.scope(), err)) return false;
+    if (!dyndep.empty()) return fail("dyndep edges are not supported yet");
+    if (!edge->EvaluateVariable(&edge->tags_, kTags, edge->pos_.scope(), err)) return false;
+    prepared.emplace_back(owners[anchor], std::move(edge));
+  }
+  std::set<Node*> outputs;
+  for (const auto& pair : owners) {
+    if (removed.count(pair.first)) continue;
+    outputs.insert(pair.first->outputs_.begin(), pair.first->outputs_.end());
+  }
+  for (const auto& pair : prepared)
+    for (Node* output : pair.second->outputs_)
+      if (!outputs.insert(output).second) return fail("multiple producers in resulting graph");
+  for (Clump* clump : clumps) {
+    auto& edges = clump->edges_;
+    edges.erase(std::remove_if(edges.begin(), edges.end(),
+                             [&](Edge* edge) { return removed.count(edge); }), edges.end());
+  }
+  for (auto& pair : prepared) pair.first->edges_.push_back(pair.second.release());
+  return true;
+}
+
+static bool ReadGraphDeltaFile(const std::string& filename,
+                               std::vector<GraphDeltaOperation>* operations,
+                               const std::string& expected_digest,
+                               std::string* err) {
+  std::ifstream input(filename);
+  if (!input) { *err = "cannot open graph delta file '" + filename + "'"; return false; }
+  std::vector<std::string> lines;
+  std::string line;
+  while (std::getline(input, line)) lines.push_back(line);
+  size_t index = 0;
+  auto read = [&](std::string* value) {
+    if (index >= lines.size()) return false;
+    *value = lines[index++]; return true;
+  };
+  auto count = [&](size_t* value) {
+    std::string text;
+    if (!read(&text) || text.empty()) return false;
+    char* end = nullptr; unsigned long parsed = strtoul(text.c_str(), &end, 10);
+    if (*end != '\0') return false; *value = parsed; return true;
+  };
+  auto field = [&](std::string* value) {
+    std::string encoded;
+    return read(&encoded) && DecodeBase64(encoded, value);
+  };
+  std::string version;
+  std::string base_digest;
+  size_t operation_count;
+  if (!read(&version) || version != "GD1" || !read(&base_digest) ||
+      base_digest.size() != 64 ||
+      base_digest.find_first_not_of("0123456789abcdef") != std::string::npos ||
+      !count(&operation_count)) {
+    *err = "invalid graph delta header"; return false;
+  }
+  if (!expected_digest.empty() && base_digest != expected_digest) {
+    *err = "stale graph delta: base manifest digest mismatch (delta " +
+           base_digest + ", manifest " + expected_digest + ")";
+    return false;
+  }
+  operations->clear(); operations->reserve(operation_count);
+  for (size_t i = 0; i < operation_count; ++i) {
+    std::string kind, output, expected_digest, context, rule;
+    if (!read(&kind) || !field(&output) || !field(&expected_digest) ||
+        !field(&context) || !field(&rule)) {
+      *err = "invalid graph delta operation"; return false;
+    }
+    GraphDeltaOperation operation;
+    operation.kind = kind == "add" ? GraphDeltaOperation::Add :
+                     kind == "remove" ? GraphDeltaOperation::Remove :
+                     kind == "replace" ? GraphDeltaOperation::Replace :
+                     GraphDeltaOperation::Add;
+    if (kind != "add" && kind != "remove" && kind != "replace") {
+      *err = "invalid graph delta operation kind"; return false;
+    }
+    operation.output = output; operation.edge.context_output = context;
+    operation.expected_digest = expected_digest;
+    operation.edge.rule = rule;
+    if (kind == "remove" && expected_digest.empty()) {
+      *err = "remove graph delta operation has no expected digest"; return false;
+    }
+    if (kind == "remove") {
+      operations->push_back(std::move(operation));
+      continue;
+    }
+    auto list = [&](std::vector<std::string>* values) {
+      size_t n; if (!count(&n)) return false; values->reserve(n);
+      for (size_t j = 0; j < n; ++j) { std::string value; if (!field(&value)) return false; values->push_back(std::move(value)); }
+      return true;
+    };
+    if (!list(&operation.edge.outputs) || !list(&operation.edge.implicit_outputs) ||
+        !list(&operation.edge.inputs) || !list(&operation.edge.implicit_inputs) ||
+        !list(&operation.edge.order_only_inputs) || !list(&operation.edge.validations)) {
+      *err = "invalid graph delta edge paths"; return false;
+    }
+    size_t binding_count;
+    if (!count(&binding_count)) { *err = "invalid graph delta bindings"; return false; }
+    for (size_t j = 0; j < binding_count; ++j) {
+      std::string key, value;
+      if (!field(&key) || !field(&value)) { *err = "invalid graph delta binding"; return false; }
+      value.push_back('\n');
+      operation.edge.bindings.emplace_back(std::move(key), std::move(value));
+    }
+    operations->push_back(std::move(operation));
+  }
+  if (index != lines.size()) { *err = "trailing graph delta data"; return false; }
+  return true;
+}
 
 struct ManifestLoader {
 private:
@@ -661,6 +912,13 @@ bool ManifestLoader::FinishLoading(const std::vector<Clump*>& clumps,
     METRIC_RECORD(".ninja load : expand source sets");
     if (!ApplyUniMappedSourceSets(state_, clumps, err)) return false;
   }
+  if (!ApplyGraphDelta(state_, clumps, options_.graph_delta, err)) return false;
+  if (!options_.graph_delta_file.empty()) {
+    std::vector<GraphDeltaOperation> operations;
+    if (!ReadGraphDeltaFile(options_.graph_delta_file, &operations,
+                            options_.graph_delta_base_digest, err) ||
+        !ApplyGraphDelta(state_, clumps, operations, err)) return false;
+  }
   {
     // Record the in-edge for each node that's built by an edge. Detect
     // duplicate edges.
@@ -821,6 +1079,8 @@ bool ManifestLoader::Load(ManifestFileSet* file_set,
                                    err)) {
     return false;
   }
+  if (!options_.graph_delta_file.empty())
+    options_.graph_delta_base_digest = file_set->GraphDigest();
   return FinishLoading(clumps, err);
 }
 
@@ -833,6 +1093,8 @@ bool ManifestParser::Load(const string& filename, string* err) {
   const LoadedFile* file = nullptr;
   if (!file_set.LoadFile(filename, &file, err))
     return false;
+  if (!options_.graph_delta_file.empty())
+    options_.graph_delta_base_digest = GraphDeltaDigest(file->content());
 
   std::unique_ptr<ThreadPool> thread_pool = CreateThreadPool();
   ManifestLoader loader(state_, thread_pool.get(), options_, false);

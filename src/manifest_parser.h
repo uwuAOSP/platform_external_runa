@@ -16,6 +16,7 @@
 #define NINJA_MANIFEST_PARSER_H_
 
 #include <string>
+#include "graph_delta.h"
 
 struct FileReader;
 struct State;
@@ -37,6 +38,10 @@ struct ManifestParserOptions {
   // Expand source membership while loading the existing graph, before linking
   // adjacency. The scheduler never needs to parse the manifest a second time.
   bool uni_source_globs = false;
+  // Applied before graph adjacency is linked and before dependency scanning.
+  std::vector<GraphDeltaOperation> graph_delta;
+  std::string graph_delta_file;
+  std::string graph_delta_base_digest;
 };
 
 struct ManifestParser {
