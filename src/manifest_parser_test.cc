@@ -15,11 +15,166 @@
 #include "manifest_parser.h"
 
 #include <map>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <vector>
 
 #include "graph.h"
 #include "state.h"
 #include "test.h"
+
+namespace {
+
+std::string EncodeSourceSetForTest(const std::string& value) {
+  static const char chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  uint32_t buffer = 0;
+  int bits = 0;
+  std::string result;
+  for (unsigned char byte : value) {
+    buffer = (buffer << 8) | byte;
+    bits += 8;
+    while (bits >= 6) {
+      bits -= 6;
+      result += chars[(buffer >> bits) & 63];
+    }
+  }
+  if (bits) result += chars[(buffer << (6 - bits)) & 63];
+  return result;
+}
+
+struct SourceGlobParserTest : testing::Test {
+  void SetUp() override { temp.CreateAndEnter("source-sets"); }
+  void TearDown() override { temp.Cleanup(); }
+
+  void Write(const std::string& path) {
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path());
+    std::ofstream file(path);
+    file << "source\n";
+    ASSERT_TRUE(file.good());
+  }
+
+  std::vector<std::string> Inputs(State& state, const std::string& output) {
+    std::vector<std::string> result;
+    Node* node = state.LookupNode(state.root_scope_.GlobalPath(output));
+    if (!node || !node->in_edge()) return result;
+    for (Node* input : node->in_edge()->inputs_) result.push_back(input->path());
+    return result;
+  }
+
+  ScopedTempDir temp;
+};
+
+TEST_F(SourceGlobParserTest, RefreshesLiveMembershipAndExclusions) {
+  Write("src/a.java");
+  Write("src/nested/b.java");
+  Write("src/nested/excluded.java");
+  const std::string graph = "rule collect\n  command = cat $in > $out\n"
+      "build result: collect src/a.java\n  runa_source_globs = " +
+      EncodeSourceSetForTest("G1\n1\nsrc/**/*.java\n1\nsrc/**/excluded.java\n1\nsrc/a.java\n") + "\n";
+  ManifestParserOptions options;
+  options.uni_source_globs = true;
+  {
+    State state;
+    ManifestParser parser(&state, nullptr, options);
+    std::string err;
+    ASSERT_TRUE(parser.ParseTest(graph.c_str(), &err));
+    const std::vector<std::string> expected = {"src/a.java", "src/nested/b.java"};
+    EXPECT_EQ(expected, Inputs(state, "result"));
+    VerifyGraph(state);
+  }
+  std::filesystem::remove("src/a.java");
+  {
+    State state;
+    ManifestParser parser(&state, nullptr, options);
+    std::string err;
+    ASSERT_TRUE(parser.ParseTest(graph.c_str(), &err));
+    const std::vector<std::string> expected = {"src/nested/b.java"};
+    EXPECT_EQ(expected, Inputs(state, "result"));
+    VerifyGraph(state);
+  }
+}
+
+TEST_F(SourceGlobParserTest, CompileTemplateIsNotExpandedAsInputCollection) {
+  Write("src/a.cc");
+  Write("src/b.cc");
+  const std::string metadata = EncodeSourceSetForTest("C1\n1\nsrc/*.cc\n0\n1\nsrc/a.cc\nobj/src/a.o\n");
+  const std::string graph = "rule cc\n  command = cc $in -o $object\n"
+      "rule link\n  command = ld $in -o $out\n"
+      "build obj/src/a.o | obj/src/a.gcno: cc src/a.cc\n  object = obj/src/a.o\n"
+      "  runa_source_globs = " + EncodeSourceSetForTest("G1\n1\nsrc/*.cc\n0\n1\nsrc/a.cc\n") + "\n"
+      "build result: link obj/src/a.o\n  runa_dynamic_cpp = " + metadata + "\n"
+      "build other: link obj/src/a.o\n  runa_dynamic_cpp = " + metadata + "\n";
+  State state;
+  ManifestParserOptions options;
+  options.uni_source_globs = true;
+  options.dupe_edge_action_ = kDupeEdgeActionError;
+  ManifestParser parser(&state, nullptr, options);
+  std::string err;
+  ASSERT_TRUE(parser.ParseTest(graph.c_str(), &err));
+  const std::vector<std::string> compile_inputs = {"src/a.cc"};
+  const std::vector<std::string> cloned_inputs = {"src/b.cc"};
+  const std::vector<std::string> link_inputs = {"obj/src/a.o", "obj/src/b.o"};
+  EXPECT_EQ(compile_inputs, Inputs(state, "obj/src/a.o"));
+  EXPECT_EQ(cloned_inputs, Inputs(state, "obj/src/b.o"));
+  EXPECT_EQ(link_inputs, Inputs(state, "result"));
+  EXPECT_EQ(link_inputs, Inputs(state, "other"));
+  EXPECT_EQ(4u, state.edges_.size());
+  Node* auxiliary = state.LookupNode(state.root_scope_.GlobalPath("obj/src/b.gcno"));
+  ASSERT_TRUE(auxiliary);
+  EXPECT_TRUE(auxiliary->in_edge());
+  VerifyGraph(state);
+}
+
+TEST_F(SourceGlobParserTest, ResourceBatchPreservesDependencyClasses) {
+  Write("res/values/b.xml");
+  Write("res/values/c.xml");
+  const std::string metadata = EncodeSourceSetForTest("A1\n1\nres/**/*.xml\n0\nres\nflat\n2\nres/values/a.xml\nflat/values_a.arsc.flat\nres/values/b.xml\nflat/values_b.arsc.flat\n");
+  const std::string graph = "rule compile\n  command = compile $in\n"
+      "rule collect\n  command = collect $in\n"
+      "build flat/values_a.arsc.flat flat/values_b.arsc.flat: compile res/values/a.xml res/values/b.xml\n"
+      "  runa_dynamic_aapt_inputs = " + metadata + "\n"
+      "build result: collect | flat/values_a.arsc.flat flat/values_b.arsc.flat || order\n"
+      "  runa_dynamic_aapt_compile = " + metadata + "\n";
+  State state;
+  ManifestParserOptions options;
+  options.uni_source_globs = true;
+  ManifestParser parser(&state, nullptr, options);
+  std::string err;
+  ASSERT_TRUE(parser.ParseTest(graph.c_str(), &err));
+  const std::vector<std::string> expected = {"flat/values_b.arsc.flat", "flat/values_c.arsc.flat", "order"};
+  EXPECT_EQ(expected, Inputs(state, "result"));
+  Edge* consumer = state.LookupNode(state.root_scope_.GlobalPath("result"))->in_edge();
+  EXPECT_EQ(0, consumer->explicit_deps_);
+  EXPECT_EQ(2, consumer->implicit_deps_);
+  EXPECT_EQ(1, consumer->order_only_deps_);
+  Node* deleted = state.LookupNode(state.root_scope_.GlobalPath("flat/values_a.arsc.flat"));
+  ASSERT_TRUE(deleted);
+  EXPECT_FALSE(deleted->in_edge());
+  VerifyGraph(state);
+}
+
+TEST_F(SourceGlobParserTest, DisabledByDefaultAndMalformedMetadataFailsClosed) {
+  const char* graph = "build result: phony old\n  runa_source_globs = invalid\n";
+  {
+    State state;
+    ManifestParser parser(&state, nullptr);
+    std::string err;
+    EXPECT_TRUE(parser.ParseTest(graph, &err));
+    VerifyGraph(state);
+  }
+  {
+    State state;
+    ManifestParserOptions options;
+    options.uni_source_globs = true;
+    ManifestParser parser(&state, nullptr, options);
+    std::string err;
+    EXPECT_FALSE(parser.ParseTest(graph, &err));
+    EXPECT_EQ("invalid runa_source_globs metadata", err);
+  }
+}
+
+}  // namespace
 
 struct ParserTest : public testing::Test {
   void AssertParse(const char* input) {

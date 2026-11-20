@@ -94,6 +94,9 @@ struct Options {
 
   /// Experimental, buggy envvar option.
   bool experimentalEnvvar;
+
+  /// Require runtime expansion of source-set declarations.
+  bool source_globs;
 };
 
 /// The Ninja main() loads up a series of data structures; various tools need
@@ -240,6 +243,7 @@ void Usage(const BuildConfig& config) {
 "\n"
 "  -j N     run N jobs in parallel (0 means infinity) [default=%d on this system]\n"
 "  --parallelism-file FILE read runtime job limits without interrupting commands\n"
+"  --source-globs expand source-set declarations while loading the manifest\n"
 "  -k N     keep going until N jobs fail (0 means infinity) [default=1]\n"
 "  -l N     do not start new jobs if the load average is greater than N\n"
 "  -n       dry run (don't run commands but act like they succeeded)\n"
@@ -1543,6 +1547,7 @@ int ReadFlags(int* argc, char*** argv,
     OPT_EXPERIMENTALENVVAR = 5,
     OPT_CONTROL_SOCKET = 6,
     OPT_PARALLELISM_FILE = 7,
+    OPT_SOURCE_GLOBS = 8,
   };
   const option kLongOptions[] = {
 #ifndef _WIN32
@@ -1556,6 +1561,7 @@ int ReadFlags(int* argc, char*** argv,
     { "quiet", no_argument, NULL, OPT_QUIET },
     { "experimentalEnvvar", no_argument, NULL, OPT_EXPERIMENTALENVVAR },
     { "parallelism-file", required_argument, NULL, OPT_PARALLELISM_FILE },
+    { "source-globs", no_argument, NULL, OPT_SOURCE_GLOBS },
     { NULL, 0, NULL, 0 }
   };
 
@@ -1647,6 +1653,9 @@ int ReadFlags(int* argc, char*** argv,
         break;
       case OPT_PARALLELISM_FILE:
         config->parallelism_file = optarg;
+        break;
+      case OPT_SOURCE_GLOBS:
+        options->source_globs = true;
         break;
       case 'h':
       default:
@@ -1753,7 +1762,7 @@ NORETURN void real_main(int argc, char** argv) {
     }
     parser_opts.experimentalEnvvar = options.experimentalEnvvar;
     const char* uni_state_file = getenv("UNI_STATE_FILE");
-    parser_opts.uni_source_globs = uni_state_file && *uni_state_file;
+    parser_opts.uni_source_globs = options.source_globs || (uni_state_file && *uni_state_file);
     ManifestParser parser(&ninja.state_, &ninja.disk_interface_, parser_opts);
     string err;
     if (!parser.Load(options.input_file, &err)) {

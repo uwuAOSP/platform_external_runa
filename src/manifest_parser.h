@@ -34,6 +34,8 @@ struct ManifestParserOptions {
   DupeEdgeAction dupe_edge_action_ = kDupeEdgeActionWarn;
   PhonyCycleAction phony_cycle_action_ = kPhonyCycleActionWarn;
   bool experimentalEnvvar = false;
+  // Expand source membership while loading the existing graph, before linking
+  // adjacency. The scheduler never needs to parse the manifest a second time.
   bool uni_source_globs = false;
 };
 
